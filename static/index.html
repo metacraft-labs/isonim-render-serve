@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>isonim-render-serve</title>
+  <style>
+    body {
+      background: #1d1f21;
+      color: #c5c8c6;
+      font-family: monospace;
+      margin: 0;
+      padding: 1rem;
+    }
+    h1 {
+      font-size: 1rem;
+      margin: 0 0 0.5rem 0;
+    }
+    #status {
+      font-size: 0.8rem;
+      color: #5fafff;
+      margin-bottom: 0.5rem;
+    }
+    #canvas {
+      border: 1px solid #444;
+      image-rendering: pixelated;
+      display: block;
+    }
+    #info {
+      font-size: 0.75rem;
+      color: #888;
+      margin-top: 0.5rem;
+    }
+  </style>
+</head>
+<body>
+  <h1>isonim-render-serve <small id="status">connecting...</small></h1>
+  <canvas id="canvas" width="256" height="256" tabindex="0"></canvas>
+  <div id="info">awaiting hello…</div>
+
+  <script>
+    /*
+     * Reference HTML/JS client for isonim-render-serve.
+     *
+     * Wire (matches src/isonim_render_serve/packet.nim and the
+     * RS-M0 spec in
+     * codetracer-specs/Front-Ends/IsoNim/isonim-render-stream.status.org):
+     *
+     *   * Each WebSocket *binary* message is one packet.
+     *   * F = 'F'(1) + u8 flags + u32 LE width + u32 LE height
+     *         + u32 LE length + payload bytes (RGBA8888 row-major
+     *         for full frames; diff layout for diff-region frames
+     *         once RS-M3 enables them).
+     *   * M = 'M'(1) + u32 LE length + UTF-8 JSON body.
+     *   * I = 'I'(1) + u32 LE length + UTF-8 JSON body.
+     *
+     * Little-endian everywhere.
+     */
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+    const status = document.getElementById('status');
+    const info = document.getElementById('info');
+
+    let backend = 'unknown';
+    let protocolVersion = 0;
+
+    const ws = new WebSocket(
+      (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/'
+    );
+    ws.binaryType = 'arraybuffer';
+
+    function readU32LE(view, offset) {
+      return view.getUint32(offset, /* littleEndian */ true);
+    }
+
+    function handleF(bytes) {
+      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      const flags = bytes[1];
+      if ((flags & 0xFC) !== 0) {
+        ws.close(1002, 'reserved flag bits set');
+        return;
+      }
+      const isDiff = (flags & 0x01) !== 0;
+      const isVideo = (flags & 0x02) !== 0;
+      if (isVideo) {
+        ws.close(1002, 'video bit set at protocolVersion=1');
+        return;
+      }
+      const width = readU32LE(view, 2);
+      const height = readU32LE(view, 6);
+      const length = readU32LE(view, 10);
+      const payload = bytes.subarray(14, 14 + length);
+      if (canvas.width !== width || canvas.height !== height) {
+        canvas.width = width;
+        canvas.height = height;
+      }
+      if (!isDiff) {
+        if (payload.length !== width * height * 4) {
+          ws.close(1002, 'full frame length mismatch');
+          return;
+        }
+        const img = new ImageData(new Uint8ClampedArray(payload), width, height);
+        ctx.putImageData(img, 0, 0);
+      } else {
+        const count = new DataView(payload.buffer, payload.byteOffset).getUint32(0, true);
+        let off = 4;
+        for (let i = 0; i < count; i++) {
+          const rv = new DataView(payload.buffer, payload.byteOffset + off);
+          const x = rv.getUint32(0, true);
+          const y = rv.getUint32(4, true);
+          const w = rv.getUint32(8, true);
+          const h = rv.getUint32(12, true);
+          const len = rv.getUint32(16, true);
+          off += 20;
+          const rectBytes = payload.subarray(off, off + len);
+          off += len;
+          const img = new ImageData(new Uint8ClampedArray(rectBytes), w, h);
+          ctx.putImageData(img, x, y);
+        }
+      }
+    }
+
+    function handleM(bytes) {
+      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      const length = readU32LE(view, 1);
+      const json = new TextDecoder('utf-8').decode(bytes.subarray(5, 5 + length));
+      const node = JSON.parse(json);
+      if (node.type === 'hello') {
+        backend = node.backend || 'unknown';
+        protocolVersion = node.protocolVersion || 0;
+        if (node.initialSize) {
+          canvas.width = node.initialSize.width;
+          canvas.height = node.initialSize.height;
+        }
+        status.textContent = 'connected (' + backend + ', v' + protocolVersion + ')';
+        info.textContent = 'capabilities: ' + JSON.stringify(node.capabilities || {});
+      } else if (node.type === 'resize') {
+        canvas.width = node.width;
+        canvas.height = node.height;
+      } else if (node.type === 'hot-reload') {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+      }
+    }
+
+    function encodeI(json) {
+      const enc = new TextEncoder();
+      const body = enc.encode(json);
+      const buf = new Uint8Array(5 + body.length);
+      buf[0] = 0x49;  // 'I'
+      const n = body.length;
+      buf[1] = n & 0xFF;
+      buf[2] = (n >>> 8) & 0xFF;
+      buf[3] = (n >>> 16) & 0xFF;
+      buf[4] = (n >>> 24) & 0xFF;
+      buf.set(body, 5);
+      return buf;
+    }
+
+    function sendInput(obj) {
+      if (ws.readyState !== WebSocket.OPEN) return;
+      ws.send(encodeI(JSON.stringify(obj)));
+    }
+
+    ws.addEventListener('open', () => {
+      status.textContent = 'connected';
+    });
+
+    ws.addEventListener('message', (e) => {
+      if (!(e.data instanceof ArrayBuffer)) return;
+      const bytes = new Uint8Array(e.data);
+      if (bytes.length === 0) return;
+      const kind = String.fromCharCode(bytes[0]);
+      if (kind === 'F') {
+        handleF(bytes);
+      } else if (kind === 'M') {
+        handleM(bytes);
+      }
+    });
+
+    ws.addEventListener('close', () => {
+      status.textContent = 'disconnected';
+    });
+
+    function modsFromEvent(e) {
+      return {
+        ctrl: !!e.ctrlKey,
+        shift: !!e.shiftKey,
+        alt: !!e.altKey,
+        meta: !!e.metaKey,
+      };
+    }
+
+    function pointFromEvent(e) {
+      const rect = canvas.getBoundingClientRect();
+      const x = Math.round((e.clientX - rect.left) * (canvas.width / rect.width));
+      const y = Math.round((e.clientY - rect.top) * (canvas.height / rect.height));
+      return { x: x, y: y };
+    }
+
+    canvas.addEventListener('mousedown', (e) => {
+      const p = pointFromEvent(e);
+      sendInput({
+        type: 'mouse', action: 'down', button: e.button,
+        x: p.x, y: p.y, modifiers: modsFromEvent(e),
+      });
+    });
+
+    canvas.addEventListener('mouseup', (e) => {
+      const p = pointFromEvent(e);
+      sendInput({
+        type: 'mouse', action: 'up', button: e.button,
+        x: p.x, y: p.y, modifiers: modsFromEvent(e),
+      });
+    });
+
+    canvas.addEventListener('mousemove', (e) => {
+      const p = pointFromEvent(e);
+      sendInput({
+        type: 'mouse', action: 'move', button: -1,
+        x: p.x, y: p.y, modifiers: modsFromEvent(e),
+      });
+    });
+
+    canvas.addEventListener('click', (e) => {
+      const p = pointFromEvent(e);
+      sendInput({
+        type: 'mouse', action: 'click', button: e.button,
+        x: p.x, y: p.y, modifiers: modsFromEvent(e),
+      });
+    });
+
+    canvas.addEventListener('wheel', (e) => {
+      const p = pointFromEvent(e);
+      sendInput({
+        type: 'scroll', x: p.x, y: p.y,
+        deltaX: e.deltaX, deltaY: e.deltaY,
+        modifiers: modsFromEvent(e),
+      });
+    });
+
+    canvas.addEventListener('keydown', (e) => {
+      sendInput({
+        type: 'key', action: 'down', key: e.key, code: e.code,
+        modifiers: modsFromEvent(e), repeat: !!e.repeat,
+      });
+    });
+
+    canvas.addEventListener('keyup', (e) => {
+      sendInput({
+        type: 'key', action: 'up', key: e.key, code: e.code,
+        modifiers: modsFromEvent(e), repeat: false,
+      });
+    });
+
+    canvas.addEventListener('focus', () => {
+      sendInput({ type: 'focus', focused: true });
+    });
+
+    canvas.addEventListener('blur', () => {
+      sendInput({ type: 'focus', focused: false });
+    });
+
+    window.addEventListener('resize', () => {
+      sendInput({ type: 'resize', width: canvas.width, height: canvas.height });
+    });
+  </script>
+</body>
+</html>
