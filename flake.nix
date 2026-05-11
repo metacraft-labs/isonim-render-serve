@@ -80,6 +80,15 @@
               if [ -d "$PWD/../isonim-gpui/rust/target/debug" ]; then
                 export LD_LIBRARY_PATH="$PWD/../isonim-gpui/rust/target/debug''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
               fi
+              # RS-M4: same trick for the Freya adapter. The shim is
+              # built via `cd ../isonim-freya && just rust-build`;
+              # this hook makes `libfreya_nim_shim.so` resolvable at
+              # run time so `nim c -r` tests that import
+              # `isonim_freya/renderer` (transitively through the
+              # adapter / the EX-M4 task_app demo) link cleanly.
+              if [ -d "$PWD/../isonim-freya/rust/target/debug" ]; then
+                export LD_LIBRARY_PATH="$PWD/../isonim-freya/rust/target/debug''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+              fi
               echo "isonim-render-serve dev shell - nim $(nim --version 2>&1 | head -1)"
             '';
           };

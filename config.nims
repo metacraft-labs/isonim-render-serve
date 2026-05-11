@@ -24,6 +24,12 @@ switch("path", "$config/../nim-faststreams")
 # `LD_LIBRARY_PATH` for run-time loading.
 switch("path", "$config/../isonim-gpui/src")
 
+# RS-M4: Freya streaming adapter pulls `isonim_freya/renderer`. As
+# with the GPUI shim, run-time loading needs `LD_LIBRARY_PATH` to
+# include `../isonim-freya/rust/target/debug`; the flake's
+# shellHook handles that.
+switch("path", "$config/../isonim-freya/src")
+
 # RS-M2: the streaming integration test instantiates the canonical
 # GPUI task_app demo (the EX-M3 composition root at
 # `task_app/main_gpui.nim`) as the frame source. Pulling the demo
