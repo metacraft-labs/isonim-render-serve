@@ -43,6 +43,24 @@ switch("path", "$config/../isonim-freya/src")
 # never touches AppKit).
 switch("path", "$config/../isonim-cocoa/src")
 
+# RS-M6 (partial-linux): Android adapter pulls `isonim_android/renderer`.
+# `nim check` on this Linux host accepts the renderer module when the
+# adapter is compiled with the plain Linux build (no `-d:mockJni` /
+# `-d:commandBuffer` needed) because the Android adapter sources gate
+# every renderer-touching call site behind `when defined(android)` —
+# the Linux scaffold returns placeholder pixels and never touches JNI.
+# The cross-compile gate test (`tests/test_android_adapter_compile.nim`)
+# drives `nim check --os:android -d:mockJni` over the adapter from this
+# Linux host to catch Android-runtime-side surface drift. Two paths are
+# required because `isonim_android/renderer` lives under
+# `isonim-android/nim-lib/src/isonim_android/`, separate from the
+# `isonim-android/src/` directory that holds the broader package —
+# same pair EX-M6 used in `isonim-examples/config.nims`. No
+# `LD_LIBRARY_PATH` extension is needed on Linux (the Linux scaffold
+# never touches the JNI bridge / Android NDK).
+switch("path", "$config/../isonim-android/nim-lib/src")
+switch("path", "$config/../isonim-android/src")
+
 # RS-M2: the streaming integration test instantiates the canonical
 # GPUI task_app demo (the EX-M3 composition root at
 # `task_app/main_gpui.nim`) as the frame source. Pulling the demo

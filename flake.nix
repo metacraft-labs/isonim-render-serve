@@ -105,6 +105,27 @@
               # lands. No `LD_LIBRARY_PATH` extension is needed on
               # Linux — the scaffold returns placeholder pixels and
               # never touches AppKit.
+              # RS-M6 (partial-linux): the Android adapter
+              # (`src/isonim_render_serve/adapters/android_adapter.nim`)
+              # is scaffolded here on Linux; its Android-runtime-
+              # touching body (the `View.draw(Canvas)` → `Bitmap`
+              # capture path) is gated `when defined(android)`. The
+              # macOS engineer completes RS-M6 on an Android emulator
+              # host (Android Studio's emulator runs natively on
+              # Apple Silicon via `qemu-system-aarch64`); the
+              # `isonim_android/jni_callbacks` module raises a hard
+              # `{.error.}` unless either `-d:mockJni` (host-side test
+              # shim) or `-d:commandBuffer` (real JNI bridge) is set,
+              # so the macOS engineer's build invocations carry one
+              # of those flags. The Linux dev shell does not need the
+              # Android NDK / emulator: the cross-compile gate
+              # (`tests/test_android_adapter_compile.nim`) drives
+              # `nim check --os:android -d:mockJni` over the adapter
+              # without invoking the linker, and the Linux scaffold's
+              # `renderFrame` returns placeholder pixels without
+              # touching JNI. No `LD_LIBRARY_PATH` extension is
+              # needed on Linux — the scaffold never opens
+              # `libisonim_android_jni.so` or any other JNI bridge.
               echo "isonim-render-serve dev shell - nim $(nim --version 2>&1 | head -1)"
             '';
           };
