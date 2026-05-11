@@ -123,7 +123,7 @@ suite "isonim-render-serve: F/M/I codec":
     check node["type"].getStr == "hello"
     check node["protocolVersion"].getInt == 1
     check node["backend"].getStr == "stub"
-    check node["capabilities"]["diffRegions"].getBool == false
+    check node["capabilities"]["diffRegions"].getBool == true
     check node["initialSize"]["width"].getInt == 256
 
   test "M packet byte layout (tag + LE length)":

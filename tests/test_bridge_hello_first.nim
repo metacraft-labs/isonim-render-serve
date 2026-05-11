@@ -39,7 +39,7 @@ suite "isonim-render-serve: hello protocol":
       check node["initialSize"]["width"].getInt == 256
       check node["initialSize"]["height"].getInt == 256
       let caps = node["capabilities"]
-      check caps["diffRegions"].getBool == false
+      check caps["diffRegions"].getBool == true
       check caps["screenshot"].getBool == false
       check caps["inputKinds"].kind == JArray
       check caps["inputKinds"].len == 5

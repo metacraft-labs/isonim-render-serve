@@ -92,21 +92,45 @@ suite "RS-M2: bridge streams GPUI task_app frames":
 
       let frames = waitFor flow()
       check frames.len == 5
-      for f in frames:
-        check f.kind == fkFull
+      # RS-M3: with diff streaming on, the first frame is always
+      # full; later frames may arrive as diff F packets (empty diff
+      # when nothing changed, sub-rect diff when only some pixels
+      # changed, or full-frame fallback when the diff would exceed
+      # 50% of the full-frame size). Reconstruct the latest
+      # full-frame pixel state by applying each diff in turn, so
+      # the existing "frames evolve as the VM mutates" assertion
+      # still has something to compare.
+      check frames[0].kind == fkFull
+      check frames[0].width == 320
+      check frames[0].height == 240
+      check frames[0].pixels.len == 320 * 240 * 4
+      var reconstructed: seq[seq[byte]] = @[]
+      reconstructed.add frames[0].pixels
+      for i in 1 ..< frames.len:
+        let f = frames[i]
         check f.width == 320
         check f.height == 240
-        check f.pixels.len == 320 * 240 * 4
+        var current = reconstructed[i - 1]
+        if f.kind == fkFull:
+          check f.pixels.len == 320 * 240 * 4
+          current = f.pixels
+        else:
+          for r in f.rects:
+            let stride = 320 * 4
+            for row in 0 ..< r.h:
+              let srcOff = row * r.w * 4
+              let dstOff = (r.y + row) * stride + r.x * 4
+              for k in 0 ..< r.w * 4:
+                current[dstOff + k] = r.pixels[srcOff + k]
+        reconstructed.add current
 
       # The first frame was captured *before* the test mutated the
-      # VM; at least one later frame must differ (the rasterizer's
-      # output depends on the tree's child count / per-element
-      # labels, which the VM mutations grow).
+      # VM; at least one later reconstructed frame must differ.
       var someDifferent = false
-      for i in 1 ..< frames.len:
+      for i in 1 ..< reconstructed.len:
         var differs = false
-        for j in 0 ..< frames[0].pixels.len:
-          if frames[0].pixels[j] != frames[i].pixels[j]:
+        for j in 0 ..< reconstructed[0].len:
+          if reconstructed[0][j] != reconstructed[i][j]:
             differs = true
             break
         if differs:

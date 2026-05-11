@@ -29,13 +29,14 @@
 ## directly (the constructor builds the wrapper for the caller).
 
 import std/[asyncdispatch, asynchttpserver, asyncnet, base64,
-            httpcore, json, nativesockets, os, strutils]
+            httpcore, json, nativesockets, options, os, strutils]
 import std/sha1 as sha1Mod
 
 import ./packet
 import ./ws_frame
 import ./event_dispatch
 import ./frame_source
+import ./diff_region
 
 const
   WebSocketGuid* = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -108,7 +109,7 @@ proc buildHelloJson*(backend: string; width, height: int): string =
   ##   { type: "hello", protocolVersion: 1, backend, capabilities,
   ##     initialSize }
   var caps = newJObject()
-  caps["diffRegions"] = newJBool(false)   # flipped at RS-M3
+  caps["diffRegions"] = newJBool(true)    # RS-M3 advertises diff support
   caps["screenshot"] = newJBool(false)    # stub backend has none
   caps["hotReload"] = newJBool(false)
   caps["inputKinds"] = %* ["key", "mouse", "scroll", "resize", "focus"]
@@ -147,6 +148,12 @@ type
   ConnectionState = ref object
     helloSent: bool
     closed: bool
+    lastSentFrame: Option[Frame]
+      ## RS-M3: per-connection snapshot of the last full RGBA frame
+      ## actually shipped to this client. The diff-region encoder
+      ## compares against this on the next tick; `none` means the
+      ## next frame must be sent in full (e.g. first frame on the
+      ## connection, or after a size change invalidates the cache).
 
 proc sendHello(client: AsyncSocket; cfg: BridgeConfig;
                state: ConnectionState) {.async.} =
@@ -157,6 +164,39 @@ proc sendHello(client: AsyncSocket; cfg: BridgeConfig;
   await sendBinary(client, encodeMeta(meta))
   state.helloSent = true
 
+proc buildOutgoingFrame(curr: Frame; state: ConnectionState): Frame =
+  ## RS-M3 outgoing-frame policy:
+  ##
+  ##   - First frame on a connection (no `lastSentFrame`): emit as
+  ##     full RGBA. The client has nothing to diff against.
+  ##   - Resize mid-stream (dimensions differ from the cache): emit
+  ##     as full and invalidate the cache. We never diff across a
+  ##     size change.
+  ##   - Otherwise: ask `computeDiffRegions` for the rectangle list.
+  ##     Empty list → identical frame, but we still must ship
+  ##     *something* every tick (the client uses the F packet as a
+  ##     heartbeat); emit an empty diff F packet. Full-frame
+  ##     fallback signaled by the encoder (one region == whole
+  ##     frame) → emit as a non-diff full F packet, which saves the
+  ##     per-rect header overhead.
+  if state.lastSentFrame.isNone:
+    return curr
+  let prev = state.lastSentFrame.get
+  if prev.width != curr.width or prev.height != curr.height:
+    return curr
+  let regions = computeDiffRegions(prev, curr)
+  if regions.len == 0:
+    return Frame(kind: fkDiff,
+                 flags: FrameFlags(isDiff: true, isVideo: false),
+                 width: curr.width, height: curr.height,
+                 rects: @[])
+  if isFullFrameRegion(regions, curr.width, curr.height):
+    return curr
+  return Frame(kind: fkDiff,
+               flags: FrameFlags(isDiff: true, isVideo: false),
+               width: curr.width, height: curr.height,
+               rects: toDirtyRects(regions))
+
 proc frameLoop(client: AsyncSocket; cfg: BridgeConfig;
                state: ConnectionState) {.async.} =
   ## Push the stub source's frames at the configured cadence until
@@ -166,11 +206,16 @@ proc frameLoop(client: AsyncSocket; cfg: BridgeConfig;
     if not state.helloSent:
       await sleepAsync(5)
       continue
-    let frame = cfg.frameSource.renderFrame()
+    let curr = cfg.frameSource.renderFrame()
+    let outFrame = buildOutgoingFrame(curr, state)
     try:
-      await sendBinary(client, encodeFrame(frame))
+      await sendBinary(client, encodeFrame(outFrame))
     except OSError, IOError:
       return
+    # Cache the *current full frame* for the next tick's diff, not
+    # the encoded outgoing frame (which may be a diff). Caching the
+    # full frame keeps the diff path correct across multiple ticks.
+    state.lastSentFrame = some(curr)
     inc sent
     if cfg.maxFrames > 0 and sent >= cfg.maxFrames:
       return
@@ -250,7 +295,8 @@ proc handleInbound(client: AsyncSocket; cfg: BridgeConfig;
         return
 
 proc bridgeOnce(client: AsyncSocket; cfg: BridgeConfig) {.async.} =
-  let state = ConnectionState(helloSent: false, closed: false)
+  let state = ConnectionState(helloSent: false, closed: false,
+                              lastSentFrame: none(Frame))
   await sendHello(client, cfg, state)
   let outFut = frameLoop(client, cfg, state)
   let inFut = handleInbound(client, cfg, state)

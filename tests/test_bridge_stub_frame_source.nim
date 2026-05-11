@@ -45,6 +45,11 @@ suite "isonim-render-serve: stub frame source over real WS":
 
       let frames = waitFor flow()
       check frames.len == 5
+      # RS-M3: the stub gradient changes *every* pixel between
+      # ticks, so the diff-region encoder always trips the
+      # 50%-of-full-frame threshold and falls back to a non-diff
+      # full F packet. Bridge therefore still ships fkFull for
+      # every tick on this source.
       for f in frames:
         check f.kind == fkFull
         check f.width == 256

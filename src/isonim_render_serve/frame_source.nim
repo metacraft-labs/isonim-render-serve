@@ -29,9 +29,11 @@
 ## wrapper. The stub source is exposed the same way via
 ## `stub_frame_source.toAny`.
 ##
-## RS-M3 will add a `lastFrame` snapshot to the wrapper so the
-## diff-region pass can compare successive frames without forcing
-## every adapter to retain its own copy.
+## RS-M3 keeps the diff-region snapshot in the bridge's
+## per-connection `ConnectionState` rather than on the wrapper,
+## because a single shared `AnyFrameSource` may be observed by
+## multiple concurrent clients whose diff state must not collide.
+## The wrapper stays a pure dispatch handle.
 
 import ./packet
 

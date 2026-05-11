@@ -17,10 +17,12 @@ import ./isonim_render_serve/packet
 import ./isonim_render_serve/ws_frame
 import ./isonim_render_serve/event_dispatch
 import ./isonim_render_serve/frame_source
+import ./isonim_render_serve/diff_region
 import ./isonim_render_serve/stub_frame_source
 import ./isonim_render_serve/bridge
 
-export packet, ws_frame, event_dispatch, frame_source, stub_frame_source, bridge
+export packet, ws_frame, event_dispatch, frame_source, diff_region,
+       stub_frame_source, bridge
 
 when isMainModule:
   import std/[asyncdispatch, nativesockets, os, strutils]
