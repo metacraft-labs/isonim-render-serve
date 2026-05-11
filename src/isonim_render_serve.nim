@@ -27,11 +27,20 @@ export packet, ws_frame, event_dispatch, frame_source, diff_region,
 when isMainModule:
   import std/[asyncdispatch, nativesockets, os, strutils]
   proc main() =
+    ## RS-M7: the stub CLI now accepts `--backend <name>` so the
+    ## IsoNim Editor's streaming-preview widget can spawn the bridge
+    ## as a child process per the selected preview mode (stub /
+    ## gpui / freya / cocoa / android) and confirm via the hello M
+    ## packet that the bridge launched with the expected backend
+    ## identifier. The flag is the same identifier the per-back-end
+    ## adapter binaries (when shipped from `isonim-examples`)
+    ## announce in their own hello packets.
     var port = 8765
     var staticDir = "static"
     var width = 256
     var height = 256
     var fps = 5
+    var backend = "stub"
     var i = 1
     while i <= paramCount():
       let arg = paramStr(i)
@@ -46,6 +55,8 @@ when isMainModule:
         inc i; height = parseInt(paramStr(i))
       of "--fps":
         inc i; fps = parseInt(paramStr(i))
+      of "--backend":
+        inc i; backend = paramStr(i)
       else:
         quit("unknown arg: " & arg, 1)
       inc i
@@ -54,13 +65,13 @@ when isMainModule:
     let cfg = BridgeConfig(
       port: Port(port),
       staticDir: staticDir,
-      backend: "stub",
+      backend: backend,
       frameIntervalMs: max(1, 1000 div fps),
       maxFrames: 0,
       inputSink: sink.toAny(),
       frameSource: source.toAny())
     let s = newServer(cfg)
     echo "isonim-render-serve listening on http://0.0.0.0:", port,
-         " (stub ", width, "x", height, " @ ", fps, " fps)"
+         " (", backend, " ", width, "x", height, " @ ", fps, " fps)"
     waitFor s.serve()
   main()
