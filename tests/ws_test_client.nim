@@ -97,5 +97,22 @@ proc makeStubConfig*(port: int; backend = "stub"; fps = 20;
     backend: backend,
     frameIntervalMs: max(1, 1000 div fps),
     maxFrames: maxFrames,
-    inputSink: newBufferedInputSink(),
-    frameSource: newStubFrameSource(256, 256))
+    inputSink: newBufferedInputSink().toAny(),
+    frameSource: newStubFrameSource(256, 256).toAny())
+
+proc makeStubConfigWithSink*(port: int; sink: BufferedInputSink;
+                             backend = "stub"; fps = 20;
+                             maxFrames = 0): BridgeConfig =
+  ## Variant of `makeStubConfig` that lets the test keep a typed
+  ## handle on the underlying `BufferedInputSink` so it can assert
+  ## the captured event log directly (the broadened
+  ## `BridgeConfig.inputSink` field hides the concrete sink behind a
+  ## polymorphic wrapper).
+  BridgeConfig(
+    port: Port(port),
+    staticDir: ".",
+    backend: backend,
+    frameIntervalMs: max(1, 1000 div fps),
+    maxFrames: maxFrames,
+    inputSink: sink.toAny(),
+    frameSource: newStubFrameSource(256, 256).toAny())

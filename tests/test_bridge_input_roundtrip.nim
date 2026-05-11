@@ -24,8 +24,8 @@ suite "isonim-render-serve: I packet round-trip":
     else:
       randomize()
       let port = pickPort()
-      var cfg = makeStubConfig(port, fps = 50, maxFrames = 0)
-      let sink = cfg.inputSink
+      let sink = newBufferedInputSink()
+      var cfg = makeStubConfigWithSink(port, sink, fps = 50, maxFrames = 0)
       discard startServer(cfg)
 
       proc flow() {.async.} =
@@ -62,8 +62,8 @@ suite "isonim-render-serve: I packet round-trip":
     else:
       randomize()
       let port = pickPort()
-      var cfg = makeStubConfig(port, fps = 50)
-      let sink = cfg.inputSink
+      let sink = newBufferedInputSink()
+      var cfg = makeStubConfigWithSink(port, sink, fps = 50)
       discard startServer(cfg)
 
       let events = @[

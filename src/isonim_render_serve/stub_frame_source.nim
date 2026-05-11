@@ -17,6 +17,7 @@
 ## the bridge code.
 
 import ./packet
+import ./frame_source
 
 type
   StubFrameSource* = ref object
@@ -61,3 +62,20 @@ type
   FrameSource* = concept fs
     fs.renderFrame() is Frame
     fs.close()
+
+# ---------------------------------------------------------------------------
+# Polymorphic wrapper
+# ---------------------------------------------------------------------------
+
+proc toAny*(s: StubFrameSource): AnyFrameSource =
+  ## Wrap the stub in a closure-backed `AnyFrameSource` so it can be
+  ## dropped into `BridgeConfig.frameSource` alongside real adapters
+  ## (e.g. RS-M2's GPUI source). The wrapper carries the stub's
+  ## current `(width, height)` so the bridge's `hello` builder can
+  ## read the initial size without calling `renderFrame`.
+  let captured = s
+  newAnyFrameSource(s.width, s.height,
+    renderFrameImpl = proc(): Frame {.gcsafe.} =
+      {.cast(gcsafe).}: captured.renderFrame(),
+    closeImpl = proc() {.gcsafe.} =
+      {.cast(gcsafe).}: captured.close())

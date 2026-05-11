@@ -44,6 +44,16 @@ type
   InputSink* = concept sink
     sink.submit(event: InputEvent)
 
+  AnyInputSink* = ref object
+    ## RS-M2 polymorphic wrapper for the inbound (`I` packet) leg of
+    ## the bridge — the analogue to `AnyFrameSource` on the outbound
+    ## side. Lets the bridge hand decoded `InputEvent`s to any sink
+    ## (RS-M1's `BufferedInputSink`, RS-M2's GPUI input sink, future
+    ## per-back-end sinks) without `bridge.nim` knowing the concrete
+    ## sink type. The closure is tagged `gcsafe` so the bridge's
+    ## `--threads:on` build passes the `serve` gcsafe check.
+    submitImpl*: proc(event: InputEvent) {.closure, gcsafe.}
+
 proc decodeMods(node: JsonNode): Modifiers =
   if node == nil or node.kind != JObject: return
   template flagOf(name: string): bool =
@@ -220,3 +230,23 @@ proc submit*(sink: BufferedInputSink; event: InputEvent) =
 # test assertions.
 proc joinLog*(sink: BufferedInputSink; sep: string = "\n"): string =
   sink.log.join(sep)
+
+# ---------------------------------------------------------------------------
+# Polymorphic wrapper (RS-M2)
+# ---------------------------------------------------------------------------
+
+proc newAnyInputSink*(submitImpl: proc(event: InputEvent)
+                                     {.closure, gcsafe.}): AnyInputSink =
+  AnyInputSink(submitImpl: submitImpl)
+
+proc submit*(sink: AnyInputSink; event: InputEvent) =
+  sink.submitImpl(event)
+
+proc toAny*(s: BufferedInputSink): AnyInputSink =
+  ## Wrap the RS-M1 buffered sink in a polymorphic `AnyInputSink`.
+  ## Mirrors the `StubFrameSource.toAny` shape so call-sites that
+  ## want the buffered behaviour can still drop into the broadened
+  ## `BridgeConfig.inputSink` field.
+  let captured = s
+  newAnyInputSink(proc(event: InputEvent) {.gcsafe.} =
+    {.cast(gcsafe).}: captured.submit(event))

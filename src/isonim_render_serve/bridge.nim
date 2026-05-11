@@ -1,5 +1,5 @@
 ## Bridge — WebSocket server + hello/F/M/I loop. One process,
-## one stub frame source, many connections.
+## one frame source, many connections.
 ##
 ## Per RS-M0 the first server→client message on every fresh
 ## connection is the `hello` M packet (announces
@@ -7,9 +7,9 @@
 ## initial size). After hello the bridge enters a steady-state
 ## loop:
 ##
-##   * Every `frameIntervalMs` the stub source's `renderFrame`
-##     callback fires and the result is wrapped in an `F` packet
-##     and shipped to the client.
+##   * Every `frameIntervalMs` the configured `AnyFrameSource`'s
+##     `renderFrame` closure fires and the result is wrapped in an
+##     `F` packet and shipped to the client.
 ##   * Inbound binary frames are parsed as F / M / I packets. I
 ##     packets are decoded into typed `InputEvent` values and
 ##     handed to the configured `InputSink`. F packets from the
@@ -17,6 +17,16 @@
 ##
 ## RS-M0 error policy: any wire-protocol violation closes the
 ## connection with WS status code 1002.
+##
+## RS-M2 (this milestone) broadened `BridgeConfig.frameSource` from
+## the concrete RS-M1 `StubFrameSource` to the closure-backed
+## `AnyFrameSource` wrapper defined in `frame_source.nim`. The
+## bridge code itself is untouched modulo the field type and the
+## `import` swap — the rest of the polymorphism lives in the
+## wrapper. Concrete adapters (GPUI, Freya, Cocoa, Android, ...)
+## ship under `adapters/` and each provide a `newXxxFrameSource`
+## constructor whose return value can be dropped into the field
+## directly (the constructor builds the wrapper for the caller).
 
 import std/[asyncdispatch, asynchttpserver, asyncnet, base64,
             httpcore, json, nativesockets, os, strutils]
@@ -25,7 +35,7 @@ import std/sha1 as sha1Mod
 import ./packet
 import ./ws_frame
 import ./event_dispatch
-import ./stub_frame_source
+import ./frame_source
 
 const
   WebSocketGuid* = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -46,8 +56,22 @@ type
     backend*: string
     frameIntervalMs*: int
     maxFrames*: int           ## 0 = unlimited
-    inputSink*: BufferedInputSink
-    frameSource*: StubFrameSource
+    inputSink*: AnyInputSink
+      ## RS-M2: broadened from RS-M1's concrete `BufferedInputSink`
+      ## to the closure-backed `AnyInputSink` wrapper defined in
+      ## `event_dispatch.nim`. RS-M1 callers wrap their buffered sink
+      ## via `.toAny()`; RS-M2 adapter callers wrap their
+      ## `GpuiInputSink` (or future per-back-end sink) the same way.
+    frameSource*: AnyFrameSource
+      ## RS-M2: broadened from the concrete `StubFrameSource` to the
+      ## closure-backed `AnyFrameSource` wrapper. Adapter authors
+      ## construct an `AnyFrameSource` once (see
+      ## `adapters/gpui_adapter.nim` for the canonical example) and
+      ## drop it in here; the bridge dispatches `renderFrame` /
+      ## `close` polymorphically via the wrapper's two closures.
+      ## See `frame_source.nim`'s module docstring for the design
+      ## rationale (closure dispatch vs. concept-typed field vs.
+      ## inheritance).
 
   Server* = ref object
     cfg*: BridgeConfig

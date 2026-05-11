@@ -47,18 +47,39 @@
         {
           checks.pre-commit = preCommit;
           devShells.default = pkgs.mkShell {
-            packages = with pkgs; [
-              nim
-              nimble
-              just
-              nixfmt-rfc-style
-              markdownlint-cli2
-              shellcheck
-              shfmt
-              nodejs_20
-            ];
+            packages =
+              with pkgs;
+              [
+                nim
+                nimble
+                just
+                nixfmt-rfc-style
+                markdownlint-cli2
+                shellcheck
+                shfmt
+                nodejs_20
+              ]
+              ++ pkgs.lib.optionals (pkgs.lib.hasSuffix "linux" system) [
+                # RS-M2: the GPUI streaming adapter (and the integration
+                # tests that exercise it) load `libgpui_nim_shim.so` at
+                # run time via `{.dynlib.}`. The shim itself is built
+                # in the `isonim-gpui` repo (`just rust-build`). Even in
+                # the headless stub mode the shim has no extra link-time
+                # deps, so the only thing this dev shell needs to
+                # provide is the loader search path. We extend
+                # `LD_LIBRARY_PATH` in `shellHook` below.
+                tree-sitter
+                pkg-config
+              ];
             shellHook = ''
               ${preCommit.shellHook}
+              # RS-M2: extend LD_LIBRARY_PATH so `nim c -r` driven tests
+              # that import `isonim_gpui/renderer` find the shim cdylib.
+              # The shim is built once via `cd ../isonim-gpui && just
+              # rust-build`; this hook just makes the loader find it.
+              if [ -d "$PWD/../isonim-gpui/rust/target/debug" ]; then
+                export LD_LIBRARY_PATH="$PWD/../isonim-gpui/rust/target/debug''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+              fi
               echo "isonim-render-serve dev shell - nim $(nim --version 2>&1 | head -1)"
             '';
           };

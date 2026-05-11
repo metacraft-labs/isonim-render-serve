@@ -16,10 +16,11 @@
 import ./isonim_render_serve/packet
 import ./isonim_render_serve/ws_frame
 import ./isonim_render_serve/event_dispatch
+import ./isonim_render_serve/frame_source
 import ./isonim_render_serve/stub_frame_source
 import ./isonim_render_serve/bridge
 
-export packet, ws_frame, event_dispatch, stub_frame_source, bridge
+export packet, ws_frame, event_dispatch, frame_source, stub_frame_source, bridge
 
 when isMainModule:
   import std/[asyncdispatch, nativesockets, os, strutils]
@@ -54,8 +55,8 @@ when isMainModule:
       backend: "stub",
       frameIntervalMs: max(1, 1000 div fps),
       maxFrames: 0,
-      inputSink: sink,
-      frameSource: source)
+      inputSink: sink.toAny(),
+      frameSource: source.toAny())
     let s = newServer(cfg)
     echo "isonim-render-serve listening on http://0.0.0.0:", port,
          " (stub ", width, "x", height, " @ ", fps, " fps)"
