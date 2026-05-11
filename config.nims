@@ -30,6 +30,19 @@ switch("path", "$config/../isonim-gpui/src")
 # shellHook handles that.
 switch("path", "$config/../isonim-freya/src")
 
+# RS-M5 (partial-linux): Cocoa adapter pulls `isonim_cocoa/renderer`.
+# `nim check` on this Linux host accepts the renderer module (no
+# AppKit-link-time symbols are needed until the macOS engineer wires
+# up `bitmapImageRepForCachingDisplayInRect` per the recipe in
+# `src/isonim_render_serve/adapters/cocoa_adapter.nim`). The cross-
+# compile gate test (`tests/test_cocoa_adapter_compile.nim`) drives
+# `nim check --os:macosx` over the adapter to catch AppKit-side
+# surface drift from this Linux host. Run-time AppKit linking is the
+# macOS engineer's responsibility; no `LD_LIBRARY_PATH` extension is
+# needed on Linux (the Linux scaffold returns placeholder pixels and
+# never touches AppKit).
+switch("path", "$config/../isonim-cocoa/src")
+
 # RS-M2: the streaming integration test instantiates the canonical
 # GPUI task_app demo (the EX-M3 composition root at
 # `task_app/main_gpui.nim`) as the frame source. Pulling the demo

@@ -6,7 +6,7 @@ alias fmt := format
 src-paths := "--path:src --path:tests"
 nim-flags := "--styleCheck:usages --styleCheck:error"
 
-tests := "tests/test_packet_codec_roundtrip.nim tests/test_ws_frame_codec.nim tests/test_bridge_hello_first.nim tests/test_bridge_stub_frame_source.nim tests/test_bridge_input_roundtrip.nim tests/test_protocol_violation_close.nim tests/test_gpui_adapter_renderframe.nim tests/test_gpui_adapter_streams_task_app.nim tests/test_gpui_input_routes_to_fireevent.nim tests/test_diff_region_encoder.nim tests/test_bridge_diff_streaming.nim tests/test_browser_diff_decoder.nim tests/test_freya_adapter_renderframe.nim tests/test_freya_adapter_streams_task_app.nim tests/test_freya_input_routes_to_fireevent.nim"
+tests := "tests/test_packet_codec_roundtrip.nim tests/test_ws_frame_codec.nim tests/test_bridge_hello_first.nim tests/test_bridge_stub_frame_source.nim tests/test_bridge_input_roundtrip.nim tests/test_protocol_violation_close.nim tests/test_gpui_adapter_renderframe.nim tests/test_gpui_adapter_streams_task_app.nim tests/test_gpui_input_routes_to_fireevent.nim tests/test_diff_region_encoder.nim tests/test_bridge_diff_streaming.nim tests/test_browser_diff_decoder.nim tests/test_freya_adapter_renderframe.nim tests/test_freya_adapter_streams_task_app.nim tests/test_freya_input_routes_to_fireevent.nim tests/test_cocoa_adapter_compile.nim tests/test_cocoa_adapter_macos_only.nim"
 
 build:
     @mkdir -p test-logs

@@ -89,6 +89,22 @@
               if [ -d "$PWD/../isonim-freya/rust/target/debug" ]; then
                 export LD_LIBRARY_PATH="$PWD/../isonim-freya/rust/target/debug''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
               fi
+              # RS-M5 (partial-linux): the Cocoa adapter
+              # (`src/isonim_render_serve/adapters/cocoa_adapter.nim`)
+              # is scaffolded here on Linux; its AppKit-touching body
+              # is gated `when defined(macosx)`. On a macOS dev shell
+              # the build needs the AppKit SDK (provided automatically
+              # by Xcode-on-macOS via `xcrun`) — no Nix package needed
+              # because Apple bundles AppKit / Foundation /
+              # CoreGraphics with the OS. `isonim_cocoa/renderer`
+              # declares the link-time `{.passL: "-lobjc -framework
+              # Foundation -framework CoreGraphics".}` pragmas; the
+              # macOS engineer extends `nim c` invocations with
+              # `--passL:"-framework AppKit"` as the
+              # `bitmapImageRepForCachingDisplayInRect` capture path
+              # lands. No `LD_LIBRARY_PATH` extension is needed on
+              # Linux — the scaffold returns placeholder pixels and
+              # never touches AppKit.
               echo "isonim-render-serve dev shell - nim $(nim --version 2>&1 | head -1)"
             '';
           };
