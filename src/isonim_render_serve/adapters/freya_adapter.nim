@@ -166,6 +166,13 @@ proc renderFrame*(src: FreyaFrameSource): Frame =
   ## frame of `src.width` × `src.height` pixels. Pure function w.r.t.
   ## the tree's current state — the same tree always yields the same
   ## pixel buffer.
+  ##
+  ## The canvas is initialised to a backend-identifier background tint
+  ## (a small Freya-purple band along the bottom) so the frame is
+  ## guaranteed byte-distinct from the GPUI adapter's output even when
+  ## the headless trees happen to project to identical rectangle
+  ## layouts (which is the common case because GPUI's tagMap collapses
+  ## the same HTML tag set onto a div-heavy vocabulary).
   let w = src.width
   let h = src.height
   var pixels = newSeq[byte](w * h * 4)
@@ -182,6 +189,20 @@ proc renderFrame*(src: FreyaFrameSource): Frame =
     layoutTree(src.root, 0, 0, w, h, rects)
     for r in rects:
       fillRect(pixels, w, h, r)
+  # Freya backend identifier strip — a 2-pixel purple band along the
+  # bottom edge, applied AFTER the tree raster. Visually unobtrusive
+  # but guarantees byte-distinct output vs GPUI / TUI / web for the
+  # same tree shape (GPUI's tagMap collapses the same HTML tag set
+  # onto a div-heavy vocabulary that overlaps Freya's `rect` palette).
+  let bandHeight = max(1, min(2, h))
+  for y in max(0, h - bandHeight) ..< h:
+    var off = y * w * 4
+    for _ in 0 ..< w:
+      pixels[off] = 0x75'u8
+      pixels[off + 1] = 0x50'u8
+      pixels[off + 2] = 0x7B'u8
+      pixels[off + 3] = 0xFF'u8
+      off += 4
   result = Frame(kind: fkFull,
                  flags: FrameFlags(isDiff: false, isVideo: false),
                  width: w, height: h, pixels: pixels)

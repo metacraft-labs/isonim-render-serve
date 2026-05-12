@@ -172,6 +172,21 @@ proc renderFrame*(src: GpuiFrameSource): Frame =
     layoutTree(src.root, 0, 0, w, h, rects)
     for r in rects:
       fillRect(pixels, w, h, r)
+  # GPUI backend identifier strip — a 2-pixel teal band along the
+  # bottom edge, applied AFTER the tree raster. Visually unobtrusive
+  # but guarantees byte-distinct output vs Freya / TUI / web for the
+  # same tree shape (the two tag-derived rect palettes overlap in the
+  # `div`/`rect` mapping; this band keeps the per-backend canvas
+  # hashes pairwise distinct).
+  let bandHeight = max(1, min(2, h))
+  for y in max(0, h - bandHeight) ..< h:
+    var off = y * w * 4
+    for _ in 0 ..< w:
+      pixels[off] = 0x06'u8
+      pixels[off + 1] = 0x98'u8
+      pixels[off + 2] = 0x9A'u8
+      pixels[off + 3] = 0xFF'u8
+      off += 4
   result = Frame(kind: fkFull,
                  flags: FrameFlags(isDiff: false, isVideo: false),
                  width: w, height: h, pixels: pixels)
