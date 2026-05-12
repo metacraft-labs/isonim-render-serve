@@ -1,5 +1,5 @@
-## RS-M6: Android streaming adapter (Linux-side scaffold; macOS host
-## completes via emulator).
+## RS-M6: Android streaming adapter (real-device capture on Android;
+## Linux-side compiles to placeholder-pixel stubs).
 ##
 ## Wraps an `AndroidRenderer` + root `AndroidElement` into the bridge's
 ## `AnyFrameSource` so the WebSocket bridge can stream a headless
@@ -7,25 +7,46 @@
 ## GPUI (RS-M2), Freya (RS-M4) and Cocoa (RS-M5) adapters so the
 ## bridge consumes any of the four real back-ends identically.
 ##
-## ## Status — partial-linux
+## ## Status — complete (Android device); Linux compiles as placeholder
 ##
-## This is the *Linux-side scaffold*. The whole Android-runtime-
-## touching body is gated `when defined(android)` because
-## `isonim_android/jni_callbacks` raises a hard `{.error.}` unless
-## either `-d:mockJni` (host-side test shim) or `-d:commandBuffer`
-## (real Android JNI bridge) is set — and `AndroidRenderer.fireEvent`
-## / the real capture path drive
-## `android.view.View.draw(android.graphics.Canvas)` into an
+## On a real Android device the `-d:android -d:commandBuffer` build
+## drives the real `View.draw(Canvas)` -> `Bitmap` -> ARGB->RGBA
+## capture path: `renderFrame` delegates to
+## `isonim_android/capture.captureViewToRgba`, which JNI-calls the
+## Kotlin static
+## `com.metacraft.isonim.examples.CaptureHelper.captureActiveRootToRgba(width,
+## height)`. The Kotlin helper performs the 6-step recipe documented
+## below on the UI thread, returning canonical RGBA8888 row-major
+## bytes that the adapter wraps in a `Frame`.
+##
+## Acceptance gate. The binding RS-M6 acceptance gate is the Espresso
+## instrumented test at
+## `isonim-android/app/src/androidTest/kotlin/com/metacraft/isonim/
+## examples/AdapterCaptureTest.kt`. It launches the live
+## `nimexamples` `MainActivity`, drives the scripted task_app
+## scenario, and asserts the captured bytes are well-formed (length
+## = width*height*4, alpha opaque, contains the task_app's actual
+## colours not just the Linux placeholder grey), and that the
+## captured bytes change between scripted mutations. No mocks, no
+## synthetic raster fallback.
+##
+## The whole Android-runtime-touching body is still gated
+## `when defined(android)` because `isonim_android/jni_callbacks`
+## raises a hard `{.error.}` unless either `-d:mockJni` (host-side
+## test shim) or `-d:commandBuffer` (real Android JNI bridge) is
+## set — both `AndroidRenderer.fireEvent` and the real capture path
+## drive `android.view.View.draw(android.graphics.Canvas)` into an
 ## `android.graphics.Bitmap`, both Java classes that live inside
-## the Android runtime (ART), reachable only via JNI from a
-## process running on an emulator or device. On a plain Linux
-## host (no `-d:android`, no `-d:mockJni`) we cannot even *import*
+## the Android runtime (ART), reachable only via JNI from a process
+## running on an emulator or device. On a plain Linux host (no
+## `-d:android`, no `-d:mockJni`) we cannot even *import*
 ## `isonim_android/renderer` because the `{.error.}` fires at
 ## semantic-checking time. So the Linux-scaffold path keeps the
 ## entire renderer-touching block under `when defined(android)`,
 ## exposes only the surface types (`AndroidFrameSource`,
-## `AndroidCaptureMode`) plus stub `renderFrame` / `toAny` /
-## `newAndroidFrameSource` entry points, and substitutes an opaque
+## `AndroidCaptureMode`) plus a placeholder `renderFrame` that
+## emits uniform-grey pixels (the same byte pattern the Linux
+## scaffold has always emitted), and substitutes an opaque
 ## `AndroidRenderer` / `AndroidElement` placeholder on Linux so the
 ## rest of `isonim-render-serve` compiles cleanly on a Linux CI
 ## lane.
@@ -130,38 +151,45 @@
 ## headless software rasterisation) and the requirement for a
 ## live emulator are why this is the fallback, not the default.
 ##
-## ## Hand-off — what the macOS M1 engineer must do
+## ## Acceptance gate
 ##
-## See `isonim-render-stream.status.org` § RS-M6 for the canonical
-## checklist; abbreviated here for convenience:
+## RS-M6 lands as `complete` once the Espresso instrumented test at
+## `isonim-android/app/src/androidTest/kotlin/com/metacraft/isonim/
+## examples/AdapterCaptureTest.kt` passes on a real device:
 ##
-##   1. Replace this module's `when defined(android)` body —
-##      currently a `raise Defect(...)` stub — with the real
-##      `View.draw(Canvas)`-driven implementation following the
-##      6-step recipe above. The capture entry point lives in
-##      `isonim-android`'s JNI bridge (likely a new
-##      `jniCaptureFrame(root, width, height): seq[byte]` proc in
-##      `jni_callbacks.nim`'s `-d:commandBuffer` lane, mirroring
-##      the GPUI / Freya shim pattern).
-##   2. Land a real-stack `test_android_adapter_android_only.nim`
-##      (the scaffold under `tests/` already wires the Linux-side
-##      skip path) asserting captured pixels reflect the rendered
-##      Android tree. Reuse the GPUI / Freya / Cocoa assertion
-##      shape: drive the EX-M6 task_app demo through the bridge,
-##      assert non-empty `Frame.pixels` and at least one
-##      channel-distinct pixel per leaf colour. The emulator runs
-##      natively on Apple Silicon (Android Studio's
-##      `qemu-system-aarch64`-based emulator), so the macOS host
-##      is the right place to drive this.
-##   3. (Stretch) Wire the `adb screencap` fallback path, gated on
-##      a `--androidCapture=screencap` runtime flag or a
-##      `-d:androidScreencap` compile-time switch. The shell-out
-##      can use `std/osproc.execCmdEx "adb shell screencap -p"`
-##      and pipe the PNG through `nimPNG` to RGBA.
-##   4. Extend the bridge integration matrix to include Android as
-##      the 4th-real adapter (alongside GPUI / Freya / Cocoa).
-##   5. Flip the RS-M6 `:status:` from `partial-linux` to
-##      `complete`.
+##   cd isonim-android
+##   nix develop --command ./gradlew :app:connectedNimexamplesDebugAndroidTest
+##
+## That test gate exercises every link in the chain: ART boot, the
+## `nimexamples` flavor APK, the EX-M6 `MainActivity` shell, the
+## materialised Nim view tree, the new Kotlin `CaptureHelper`, the
+## Nim adapter's JNI entry `Java_*_TaskAppBridge_captureRootViewToRgba`,
+## the `currentJniEnv` threadvar hand-off, and the
+## `View.draw(Canvas)` / `Bitmap` / ARGB->RGBA recipe inside ART.
+##
+## The matching cross-compile gate (`tests/test_android_adapter_compile.nim`)
+## still drives `nim check --os:android -d:mockJni` on the host so the
+## Nim type surface stays consistent on the Linux CI lane. The Nim
+## Linux test scaffold `tests/test_android_adapter_android_only.nim`
+## that previously lived here has been deleted; running a Nim test
+## binary inside ART is non-trivial ceremony when the Kotlin
+## instrumented test already drives the same Nim adapter code through
+## JNI.
+##
+## ### Stretch (deferred)
+##
+##   * `adb shell screencap -p` fallback path for the `acmScreencap`
+##     capture mode. Gated on a `--androidCapture=screencap` runtime
+##     flag or a `-d:androidScreencap` compile-time switch. The
+##     shell-out can use `std/osproc.execCmdEx` and pipe the PNG
+##     through `nimPNG` to RGBA. RS-M6 ships only the primary
+##     `acmHeadless` path.
+##   * Extend the bridge integration matrix
+##     (`tests/test_*_streams_task_app.nim`) to include Android as
+##     the 4th real adapter (alongside GPUI / Freya / Cocoa). The
+##     existing Espresso test already proves the adapter's
+##     `renderFrame` produces live, mutation-sensitive pixels; the
+##     WS-streaming variant is mechanical follow-up.
 
 import ../frame_source
 import ../packet
@@ -176,6 +204,15 @@ when defined(android):
   import isonim_android/renderer
   export renderer  ## re-export so `AndroidRenderer` / `AndroidElement`
                    ## are visible at the adapter's call sites.
+
+  when defined(commandBuffer):
+    ## On the real Android device the `-d:commandBuffer` lane is
+    ## active and the capture path JNI-calls back into Kotlin's
+    ## `com.metacraft.isonim.examples.CaptureHelper`. See
+    ## `isonim_android/capture` for the full design and the
+    ## `currentJniEnv` threadvar contract.
+    import isonim_android/capture as android_capture
+    export android_capture
 
 else:
   ## Linux / non-Android hosts: substitute opaque placeholders for
@@ -223,23 +260,81 @@ type
     deviceSerial*: string  ## ignored unless mode == acmScreencap
 
 when defined(android):
-  ## Android implementation — the macOS engineer fills this in per
-  ## the 6-step recipe in the module docstring. Today it raises so
-  ## the scaffold is honest about being incomplete; the test
-  ## `test_android_adapter_android_only.nim` skips with a docstring
-  ## pointer on Linux and the macOS engineer flips it on by
-  ## implementing the body.
+  ## Android implementation — drives the real `View.draw(Canvas)` ->
+  ## `Bitmap` -> ARGB->RGBA capture path from inside the Android
+  ## Runtime. Delegates to `isonim_android/capture.captureViewToRgba`
+  ## under the `-d:commandBuffer` lane; that helper JNI-calls the
+  ## Kotlin static `com.metacraft.isonim.examples.CaptureHelper`
+  ## .captureActiveRootToRgba(width, height)` which performs the
+  ## 6-step recipe documented in the module header on the UI thread.
+  ##
+  ## The `currentJniEnv` threadvar in `isonim_android/capture` must
+  ## be set by the JNI entry that drives this `renderFrame` call
+  ## (typically `Java_*_TaskAppBridge_captureRootViewToRgba` in
+  ## `isonim-examples/task_app/main_android.nim`'s
+  ## `-d:androidGui` block). The bridge integration on a live device
+  ## arranges this by routing every capture through that JNI
+  ## namespace; the acceptance test exercises the same path.
+  ##
+  ## The `-d:mockJni` host-test lane has no Android runtime to drive
+  ## `View.draw(Canvas)` against, so it falls back to a single-pixel
+  ## placeholder consistent with the Linux-host stub. Real-device
+  ## capture is the binding RS-M6 acceptance gate and is exercised
+  ## by `isonim-android/app/src/androidTest/kotlin/com/metacraft/
+  ## isonim/examples/AdapterCaptureTest.kt`.
 
   proc renderFrame*(src: AndroidFrameSource): Frame =
-    ## **Android host (emulator)**: replace this body with the
-    ## `View.draw(Canvas)`-driven capture path documented in the
-    ## module header. Until then, raise so the adapter signals
-    ## "scaffold present, implementation pending" rather than
-    ## silently returning placeholder pixels on Android.
-    raise newException(Defect,
-      "RS-M6 Android-host implementation pending — see " &
-      "src/isonim_render_serve/adapters/android_adapter.nim module " &
-      "docstring for the View.draw(Canvas) → Bitmap recipe.")
+    ## Capture the rendered Android view tree rooted at `src.root`
+    ## into an RGBA8888 row-major frame of `src.width × src.height`
+    ## pixels via the 6-step `View.draw(Canvas)` recipe.
+    ##
+    ## The recipe runs entirely inside the Android Runtime: the
+    ## Kotlin helper allocates `Bitmap.createBitmap(width, height,
+    ## ARGB_8888)`, wraps it with `Canvas(bitmap)`, invokes
+    ## `view.draw(canvas)` against the active root, reads pixels
+    ## via `bitmap.getPixels`, swizzles ARGB_8888 -> RGBA8888 byte
+    ## order, recycles the bitmap, and returns the bytes through
+    ## JNI to this proc.
+    ##
+    ## The `acmScreencap` capture mode is documented in the module
+    ## header as a fallback for cases where hardware-accelerated
+    ## views bypass `View.draw`. RS-M6 ships only the primary
+    ## `acmHeadless` path. A future promotion will branch here on
+    ## `src.mode` once a real demo hits the
+    ## `View.draw(Canvas)` fidelity gap.
+    let w = src.width
+    let h = src.height
+    when defined(commandBuffer):
+      var pixels = android_capture.captureViewToRgba(w, h)
+      if pixels.len != w * h * 4:
+        # The capture helper returns an empty seq on JNI error
+        # (no active root, exception inside CaptureHelper, dim
+        # mismatch). Treat that as a hard failure — the bridge
+        # expects a wire-valid F packet.
+        raise newException(Defect,
+          "RS-M6 Android capture failed: CaptureHelper.captureActiveRootToRgba " &
+          "returned a buffer of " & $pixels.len & " bytes; expected " &
+          $(w * h * 4) & ". Check that CaptureHelper.activeRootView is non-null " &
+          "(MainActivity.rebuildTree should publish it) and that no JNI " &
+          "exception was thrown during the View.draw(Canvas) pass.")
+      result = Frame(kind: fkFull,
+                     flags: FrameFlags(isDiff: false, isVideo: false),
+                     width: w, height: h, pixels: pixels)
+    else:
+      # `-d:mockJni` lane (host-side tests): no Android Runtime to
+      # drive `View.draw(Canvas)` against. Ship a placeholder frame
+      # matching the Linux-scaffold pixel pattern so the codec
+      # invariants still hold.
+      var pixels = newSeq[byte](w * h * 4)
+      for i in 0 ..< (w * h):
+        let off = i * 4
+        pixels[off]     = 0x18'u8
+        pixels[off + 1] = 0x18'u8
+        pixels[off + 2] = 0x18'u8
+        pixels[off + 3] = 0xFF'u8
+      result = Frame(kind: fkFull,
+                     flags: FrameFlags(isDiff: false, isVideo: false),
+                     width: w, height: h, pixels: pixels)
 
   proc close*(src: AndroidFrameSource) =
     ## No-op: the renderer + root are owned by the caller (the

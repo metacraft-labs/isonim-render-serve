@@ -1,7 +1,6 @@
 ## test_android_adapter_compile — RS-M6 Linux-side cross-compile gate.
 ##
-## RS-M6 ships the Android adapter as a partial-linux scaffold: the
-## actual Android-runtime-touching capture path (in
+## RS-M6's actual Android-runtime-touching capture path (in
 ## `src/isonim_render_serve/adapters/android_adapter.nim`) is gated
 ## `when defined(android)` because
 ##
@@ -15,14 +14,32 @@
 ##      `android.view.View.draw(android.graphics.Canvas)` into a
 ##      `android.graphics.Bitmap` — both Java classes that live
 ##      inside the Android runtime (ART), reachable only via JNI
-##      from a process running on an emulator or device. The
-##      macOS engineer runs the real integration test
-##      (`test_android_adapter_android_only.nim`) on an Android
-##      emulator (Android Studio's `qemu-system-aarch64`-based
-##      emulator runs natively on Apple Silicon).
+##      from a process running on an emulator or device.
+##
+## **Canonical RS-M6 acceptance gate.** Running a Nim test binary
+## inside ART is non-trivial ceremony, and the same Nim adapter code
+## is already driven through JNI by the Kotlin instrumented test at
+##
+##   isonim-android/app/src/androidTest/kotlin/com/metacraft/isonim/
+##   examples/AdapterCaptureTest.kt
+##
+## The Kotlin instrumented test is the binding "real-device passes"
+## gate for RS-M6: it launches a real `MainActivity`, drives a real
+## scripted scenario, and calls
+## `TaskAppBridge.captureRootViewToRgba(width, height)` which is a
+## Nim-implemented JNI export (`Java_*_TaskAppBridge_captureRootViewToRgba`
+## in `isonim-examples/task_app/main_android.nim`). Run it via:
+##
+##   cd isonim-android && nix develop --command \
+##     ./gradlew :app:connectedNimexamplesDebugAndroidTest
+##
+## The previous Nim-only scaffold (`test_android_adapter_android_only.nim`)
+## was deleted as part of RS-M6 completion — keeping a Nim test file
+## that only says "real test lives elsewhere" was strictly worse than
+## the cross-link in this docstring.
 ##
 ## This test runs *here on Linux* and validates the adapter surface
-## without needing an emulator, by:
+## without needing a device, by:
 ##
 ##   1. **Cross-compile gate.** Driving `nim check --os:android
 ##      -d:mockJni` over the real
