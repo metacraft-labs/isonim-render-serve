@@ -1,4 +1,5 @@
-## RS-M5: Cocoa streaming adapter (Linux-side scaffold; macOS host completes).
+## RS-M5: Cocoa streaming adapter (real AppKit capture on macOS;
+## Linux-side compiles to placeholder-pixel stubs).
 ##
 ## Wraps a `CocoaRenderer` + root `CocoaElement` into the bridge's
 ## `AnyFrameSource` so the WebSocket bridge can stream a headless AppKit
@@ -6,20 +7,25 @@
 ## Freya (RS-M4) adapters so the bridge consumes any of the three real
 ## back-ends identically.
 ##
-## ## Status — partial-linux
+## ## Status — complete (macOS); Linux compiles as placeholder
 ##
-## This is the *Linux-side scaffold*. The whole AppKit-touching body is
-## gated `when defined(macosx)` because `isonim_cocoa/renderer`
-## transitively imports `isonim_cocoa/objc_runtime`,
-## `isonim_cocoa/foundation` and the `isonim_cocoa/appkit/*` wrappers.
-## Those modules use `{.passL: "-lobjc -framework Foundation -framework
-## CoreGraphics".}` plus inline `objc_msgSend` C blocks, none of which
-## the Linux C compiler can lower or link against. On Linux this module
-## therefore exposes only the *types* (`CocoaFrameSource`,
-## `CocoaCaptureMode`) plus stub `renderFrame` / `toAny` /
-## `newCocoaFrameSource` entry points whose bodies raise `Defect` or
-## return a placeholder grey RGBA buffer so the rest of
-## `isonim-render-serve` compiles cleanly on a Linux CI lane.
+## On macOS the body uses real AppKit: it delegates to
+## `isonim_cocoa/appkit/capture.captureViewRgba`, which drives the
+## `bitmapImageRepForCachingDisplayInRect:` /
+## `cacheDisplayInRect:toBitmapImageRep:` recipe documented below and
+## returns a canonical RGBA8888 row-major byte buffer.
+##
+## The whole AppKit-touching capture call is still gated
+## `when defined(macosx)` because `isonim_cocoa/renderer` transitively
+## imports `isonim_cocoa/objc_runtime`, `isonim_cocoa/foundation` and
+## the `isonim_cocoa/appkit/*` wrappers. Those modules use
+## `{.passL: "-lobjc -framework Foundation -framework CoreGraphics".}`
+## plus inline `objc_msgSend` C blocks, none of which the Linux C
+## compiler can lower or link against. On Linux this module therefore
+## exposes only the *types* (`CocoaFrameSource`, `CocoaCaptureMode`)
+## plus a `renderFrame` entry point that returns a uniform-grey RGBA
+## buffer so the rest of `isonim-render-serve` compiles cleanly on a
+## Linux CI lane.
 ##
 ## ## Capture approach — AppKit headless `bitmapImageRepForCachingDisplayInRect`
 ##
@@ -129,6 +135,9 @@
 
 import isonim_cocoa/renderer
 
+when defined(macosx):
+  import isonim_cocoa/appkit/capture as cocoa_capture
+
 import ../frame_source
 import ../packet
 
@@ -152,23 +161,47 @@ type
     windowId*: uint32  ## ignored unless mode == ccmWindowScreencap
 
 when defined(macosx):
-  ## macOS implementation — the macOS engineer fills this in per the
-  ## 6-step recipe in the module docstring. Today it raises so the
-  ## scaffold is honest about being incomplete; the test
-  ## `test_cocoa_adapter_macos_only.nim` skips with a docstring
-  ## pointer on Linux and the macOS engineer flips it on by
-  ## implementing the body.
+  ## macOS implementation — real `bitmapImageRepForCachingDisplayInRect`
+  ## capture path. Delegates to `isonim_cocoa/appkit/capture`, which
+  ## wraps the 6-step recipe documented in the module header
+  ## (set frame, lay out subtree, allocate `NSBitmapImageRep`, drive
+  ## `cacheDisplayInRect:toBitmapImageRep:`, inspect `bitmapFormat`,
+  ## row-by-row swizzle into canonical RGBA8888) in an ObjC `.m`
+  ## helper (`isonim_cocoa/testing/capture_rgba.m`).
 
   proc renderFrame*(src: CocoaFrameSource): Frame =
-    ## **macOS host**: replace this body with the AppKit
-    ## `bitmapImageRepForCachingDisplayInRect`-driven capture path
-    ## documented in the module header. Until then, raise so the
-    ## adapter signals "scaffold present, implementation pending"
-    ## rather than silently returning placeholder pixels on macOS.
-    raise newException(Defect,
-      "RS-M5 macOS-host implementation pending — see " &
-      "src/isonim_render_serve/adapters/cocoa_adapter.nim module " &
-      "docstring for the bitmapImageRepForCachingDisplayInRect recipe.")
+    ## Capture the rendered Cocoa tree rooted at `src.root` into an
+    ## RGBA8888 row-major frame of `src.width × src.height` pixels.
+    ##
+    ## The capture is done entirely offscreen via AppKit's
+    ## `NSView bitmapImageRepForCachingDisplayInRect:` API — no
+    ## NSWindow / event loop required. The view's frame is forced to
+    ## `(0, 0, width, height)` before the bitmap is drawn so the
+    ## requested wire dimensions match the captured raster regardless
+    ## of the view's natural size; on retina hosts the helper
+    ## nearest-neighbor downscales the (point ≠ pixel) rep so the
+    ## payload length still equals `width * height * 4`.
+    ##
+    ## The `ccmWindowScreencap` capture mode is documented in the
+    ## module header as a fallback for AppKit headless degradation;
+    ## RS-M5 ships only the primary `ccmHeadless` path. A future
+    ## promotion will branch here on `src.mode` once a real demo hits
+    ## the AppKit-headless fidelity gap.
+    let w = src.width
+    let h = src.height
+    var pixels = cocoa_capture.captureViewRgba(Id(src.root), w, h)
+    if pixels.len != w * h * 4:
+      # The capture helper returns an empty seq on AppKit error
+      # (nil view / unsupported pixel format). Treat that as a
+      # hard failure — the bridge expects a wire-valid F packet.
+      raise newException(Defect,
+        "RS-M5 Cocoa capture failed: bitmapImageRepForCachingDisplayInRect " &
+        "returned a buffer of " & $pixels.len & " bytes; expected " &
+        $(w * h * 4) & ". Check that src.root is a live NSView and that " &
+        "AppKit produced an 8-bit bitmap rep.")
+    result = Frame(kind: fkFull,
+                   flags: FrameFlags(isDiff: false, isVideo: false),
+                   width: w, height: h, pixels: pixels)
 
   proc close*(src: CocoaFrameSource) =
     ## No-op: the renderer + root are owned by the caller (the
