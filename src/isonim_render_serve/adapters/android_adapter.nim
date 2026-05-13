@@ -194,13 +194,23 @@
 import ../frame_source
 import ../packet
 
-when defined(android):
-  ## Android-target build: pull the real Android renderer + JNI
-  ## bridge. `isonim_android/jni_callbacks` raises a hard
-  ## `{.error.}` unless either `-d:mockJni` (host-side test shim)
-  ## or `-d:commandBuffer` (real emulator JNI bridge) is set, so a
-  ## plain `nim c --os:android` invocation also has to provide one
-  ## of those compile-time switches.
+when defined(android) or defined(mockJni):
+  import ../element_tree_attrs
+
+when defined(android) or defined(mockJni):
+  ## Android-target build OR host-side `-d:mockJni` lane: pull the real
+  ## Android renderer + JNI bridge. `isonim_android/jni_callbacks`
+  ## raises a hard `{.error.}` unless either `-d:mockJni` (host-side
+  ## test shim) or `-d:commandBuffer` (real emulator JNI bridge) is
+  ## set, so a plain `nim c --os:android` invocation also has to
+  ## provide one of those compile-time switches.
+  ##
+  ## RS-M11c expanded the gate from `defined(android)` to
+  ## `defined(android) or defined(mockJni)` so the host-side launcher
+  ## (`editor/backends/android.nim`) can build an in-process
+  ## `AndroidRenderer` tree under `-d:mockJni` and feed it to the
+  ## element-tree manifest builder while keeping the F-packet stream
+  ## driven by `adb exec-out screencap` against a real device.
   import isonim_android/renderer
   export renderer  ## re-export so `AndroidRenderer` / `AndroidElement`
                    ## are visible at the adapter's call sites.
@@ -259,7 +269,7 @@ type
     mode*: AndroidCaptureMode
     deviceSerial*: string  ## ignored unless mode == acmScreencap
 
-when defined(android):
+when defined(android) or defined(mockJni):
   ## Android implementation — drives the real `View.draw(Canvas)` ->
   ## `Bitmap` -> ARGB->RGBA capture path from inside the Android
   ## Runtime. Delegates to `isonim_android/capture.captureViewToRgba`
@@ -267,6 +277,13 @@ when defined(android):
   ## Kotlin static `com.metacraft.isonim.examples.CaptureHelper`
   ## .captureActiveRootToRgba(width, height)` which performs the
   ## 6-step recipe documented in the module header on the UI thread.
+  ##
+  ## Under `-d:mockJni` (host-side test shim, also used by the RS-M11c
+  ## launcher to build the in-process tree for the manifest builder)
+  ## the `View.draw(Canvas)` path has no runtime to drive, so the body
+  ## falls back to the same placeholder pixels the Linux stub returns.
+  ## The launcher does not invoke this `renderFrame` anyway — pixels
+  ## come from `adb exec-out screencap`.
   ##
   ## The `currentJniEnv` threadvar in `isonim_android/capture` must
   ## be set by the JNI entry that drives this `renderFrame` call
@@ -407,3 +424,100 @@ proc toAny*(src: AndroidFrameSource): AnyFrameSource =
       {.cast(gcsafe).}: captured.renderFrame(),
     closeImpl = proc() {.gcsafe.} =
       {.cast(gcsafe).}: captured.close())
+
+# ---------------------------------------------------------------------------
+# RS-M11c: element-tree manifest builder
+# ---------------------------------------------------------------------------
+##
+## ``buildAndroidElementTreeManifest`` walks the headless
+## ``AndroidElement`` tree via the renderer's own DFS helpers
+## (``r.childCount`` / ``r.nthChild`` / ``r.getAttribute``),
+## synthesises a vertical-stack layout — the same heuristic GPUI /
+## Freya / Cocoa use in their adapters — and emits one ``ElementEntry``
+## per node carrying a non-empty ``ComponentPathAttr`` annotation.
+##
+## Gating: the builder is only available when the renderer can be
+## imported (``-d:android`` for a real-device build, or ``-d:mockJni``
+## for host-side test / RS-M11c launcher use). On a plain Linux host
+## without either flag, `isonim_android/renderer` cannot compile (the
+## `{.error.}` in `jni_callbacks` fires), so we cannot expose a
+## meaningful manifest builder there. The launcher
+## (`editor/backends/android.nim`) provides `-d:mockJni` at build
+## time; tests `nim c --define:mockJni`.
+
+type
+  LayoutRect* = object
+    ## Per-node layout entry. Mirror of the GPUI / Freya / Cocoa
+    ## adapter's ``LayoutRect`` shape.
+    node*: AndroidElement
+    x*, y*, w*, h*: int
+    depth*: int
+    tag*, label*: string
+
+when defined(android) or defined(mockJni):
+
+  proc walkLayout(r: AndroidRenderer; node: AndroidElement;
+                  x, y, w, h: int;
+                  rects: var seq[LayoutRect]; depth = 0;
+                  maxDepth = 8) =
+    ## DFS that produces one ``LayoutRect`` per visited element.
+    if node == 0 or w <= 0 or h <= 0: return
+    if depth > maxDepth: return
+    let cls = r.getAttribute(node, "class")
+    let txt = r.textContent(node)
+    rects.add LayoutRect(node: node, x: x, y: y, w: w, h: h,
+                         depth: depth, tag: cls, label: txt & "|" & cls)
+    let count = r.childCount(node)
+    if count == 0: return
+    let headerBand = min(12, max(0, h div 4))
+    let bodyY = y + headerBand
+    let bodyH = h - headerBand
+    if bodyH <= 0: return
+    let perChild = max(1, bodyH div count)
+    var cy = bodyY
+    for i in 0 ..< count:
+      let child = r.nthChild(node, i)
+      if child == 0: continue
+      let ch =
+        if i == count - 1: bodyY + bodyH - cy
+        else: perChild
+      walkLayout(r, child, x + 4, cy, w - 8, ch, rects, depth + 1, maxDepth)
+      cy += ch
+
+  proc buildLayoutRects*(r: AndroidRenderer; root: AndroidElement;
+                         width, height: int): seq[LayoutRect] =
+    ## Public layout pass.
+    result = @[]
+    if root == 0 or width <= 0 or height <= 0: return
+    walkLayout(r, root, 0, 0, width, height, result)
+
+  proc buildAndroidElementTreeManifest*(root: AndroidElement;
+                                        width, height: int;
+                                        frameSeq: int = 0):
+                                       ElementTreeManifest =
+    ## Build a fresh manifest from the current state of the Android
+    ## tree rooted at ``root``. Idempotent: same tree → same manifest.
+    ##
+    ## Under ``-d:mockJni`` the renderer's ``viewTree`` table holds the
+    ## walkable tree; under ``-d:commandBuffer`` (real device) the tree
+    ## lives in ART and ``childCount`` / ``nthChild`` return 0 — that's
+    ## the documented host-side trade-off. The RS-M11c launcher pairs
+    ## ``-d:mockJni`` (for the manifest tree) with the
+    ## ``AdbScreencapFrameSource`` (for real-device pixels).
+    result = ElementTreeManifest(
+      frameSeq: frameSeq,
+      surfaceWidth: width,
+      surfaceHeight: height,
+      elements: @[])
+    if root == 0 or width <= 0 or height <= 0: return
+    let r = AndroidRenderer()
+    let layoutRects = buildLayoutRects(r, root, width, height)
+    for lr in layoutRects:
+      let path = r.getAttribute(lr.node, ComponentPathAttr)
+      if path.len == 0: continue
+      let kind = r.getAttribute(lr.node, ElementKindAttr)
+      result.elements.add ElementEntry(
+        id: path,
+        componentPath: path,
+        kind: kind,
+        bounds: ElementBounds(x: lr.x, y: lr.y, w: lr.w, h: lr.h))

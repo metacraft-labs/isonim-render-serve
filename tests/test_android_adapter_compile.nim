@@ -145,7 +145,11 @@ suite "RS-M6: Android adapter cross-compile gate (Linux-side)":
     check "proc toAny*(src: AndroidFrameSource): AnyFrameSource" in body
     # Android-runtime-touching body must be android-gated so the
     # Linux build stays clean; protect against accidental ungating.
-    check "when defined(android):" in body
+    # RS-M11c relaxed the gate to also accept ``defined(mockJni)`` so
+    # the host-side launcher can build an in-process Android tree
+    # for the element-tree manifest builder under ``-d:mockJni``.
+    check ("when defined(android):" in body or
+           "when defined(android) or defined(mockJni):" in body)
     # The capture-path spec must remain documented for the macOS
     # engineer. Drop any of these strings and the gate fails before
     # the engineer ever opens the file.

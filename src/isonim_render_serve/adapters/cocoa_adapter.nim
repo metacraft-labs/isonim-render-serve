@@ -140,6 +140,7 @@ when defined(macosx):
 
 import ../frame_source
 import ../packet
+import ../element_tree_attrs
 
 type
   CocoaCaptureMode* = enum
@@ -271,3 +272,114 @@ proc toAny*(src: CocoaFrameSource): AnyFrameSource =
       {.cast(gcsafe).}: captured.renderFrame(),
     closeImpl = proc() {.gcsafe.} =
       {.cast(gcsafe).}: captured.close())
+
+# ---------------------------------------------------------------------------
+# RS-M11c: element-tree manifest builder
+# ---------------------------------------------------------------------------
+##
+## ``buildCocoaElementTreeManifest`` walks the headless ``CocoaElement``
+## tree via the renderer's own DFS helpers (``r.childCount`` /
+## ``r.nthChild`` / ``r.getAttribute``), synthesises a vertical-stack
+## layout — the same heuristic GPUI / Freya use in their adapters —
+## and emits one ``ElementEntry`` per node carrying a non-empty
+## ``ComponentPathAttr`` annotation.
+##
+## The walk is platform-portable: it touches only the renderer-side
+## Nim tables holding parent/child relationships and attribute strings,
+## never invokes AppKit, and therefore compiles on Linux as well as
+## macOS. The Linux scaffold's ``renderFrame`` returns a placeholder
+## but the manifest builder still produces a real, structurally
+## correct manifest from any tree the renderer has built up.
+##
+## Note (call-site discipline): the Cocoa renderer's tree-inspection
+## helpers (``childCount``, ``nthChild``, ``getAttribute``) are methods
+## that take the renderer as their first argument — unlike GPUI /
+## Freya where these are bare procs on the element handle. The walk
+## here therefore threads a ``CocoaRenderer`` value through the
+## recursion. Construct one via ``CocoaRenderer()`` (zero-sized type)
+## when the caller doesn't already have one in scope; the renderer
+## value carries no state, only dispatch.
+
+type
+  LayoutRect* = object
+    ## Per-node layout entry. Pure geometry + identity; mirror of the
+    ## GPUI / Freya adapter's ``LayoutRect`` shape.
+    node*: CocoaElement
+    x*, y*, w*, h*: int
+    depth*: int
+    tag*, label*: string
+
+proc isNilElement(e: CocoaElement): bool {.inline.} =
+  pointer(e) == nil
+
+proc walkLayout(r: CocoaRenderer; node: CocoaElement; x, y, w, h: int;
+                rects: var seq[LayoutRect]; depth = 0; maxDepth = 8) =
+  ## DFS that produces one ``LayoutRect`` per visited element. The
+  ## traversal order matches the GPUI / Freya rasterisers' drawing
+  ## order so the manifest's per-node bounds stay byte-stable across
+  ## re-emits and across renderers.
+  if isNilElement(node) or w <= 0 or h <= 0: return
+  if depth > maxDepth: return
+  # Tag derived from the renderer's `getAttribute(node, "class")` (no
+  # public `getTag` on the Cocoa renderer); the rasteriser key here is
+  # `(tag, label)` purely for stable colouring in cross-adapter
+  # comparison plots — the manifest builder filters on
+  # ComponentPathAttr below and ignores tag entirely.
+  let cls = r.getAttribute(node, "class")
+  let txt = r.textContent(node)
+  rects.add LayoutRect(node: node, x: x, y: y, w: w, h: h,
+                       depth: depth, tag: cls, label: txt & "|" & cls)
+  let count = r.childCount(node)
+  if count == 0: return
+  # Reserve a small "header band" at the top so the parent's fill
+  # remains visible (children stack below). 12px or 1/4 of h.
+  let headerBand = min(12, max(0, h div 4))
+  let bodyY = y + headerBand
+  let bodyH = h - headerBand
+  if bodyH <= 0: return
+  let perChild = max(1, bodyH div count)
+  var cy = bodyY
+  for i in 0 ..< count:
+    let child = r.nthChild(node, i)
+    if isNilElement(child): continue
+    let ch =
+      if i == count - 1: bodyY + bodyH - cy  # last child consumes remainder
+      else: perChild
+    walkLayout(r, child, x + 4, cy, w - 8, ch, rects, depth + 1, maxDepth)
+    cy += ch
+
+proc buildLayoutRects*(r: CocoaRenderer; root: CocoaElement;
+                       width, height: int): seq[LayoutRect] =
+  ## Public layout pass. The Cocoa renderer's helpers take the renderer
+  ## as an argument, hence the extra parameter (mirror of GPUI / Freya
+  ## semantics modulo that calling convention).
+  result = @[]
+  if isNilElement(root) or width <= 0 or height <= 0: return
+  walkLayout(r, root, 0, 0, width, height, result)
+
+proc buildCocoaElementTreeManifest*(root: CocoaElement;
+                                    width, height: int;
+                                    frameSeq: int = 0):
+                                   ElementTreeManifest =
+  ## Build a fresh manifest from the current state of the Cocoa tree
+  ## rooted at ``root``. Idempotent: same tree → same manifest, so the
+  ## bridge can hash the result and skip emission when unchanged.
+  ##
+  ## Walks the renderer's headless side-tables; portable to Linux.
+  result = ElementTreeManifest(
+    frameSeq: frameSeq,
+    surfaceWidth: width,
+    surfaceHeight: height,
+    elements: @[])
+  if isNilElement(root) or width <= 0 or height <= 0: return
+  let r = CocoaRenderer()
+  let layoutRects = buildLayoutRects(r, root, width, height)
+  for lr in layoutRects:
+    let path = r.getAttribute(lr.node, ComponentPathAttr)
+    if path.len == 0: continue
+    let kind = r.getAttribute(lr.node, ElementKindAttr)
+    result.elements.add ElementEntry(
+      id: path,
+      componentPath: path,
+      kind: kind,
+      bounds: ElementBounds(x: lr.x, y: lr.y, w: lr.w, h: lr.h))
