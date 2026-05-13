@@ -20,9 +20,10 @@ import ./isonim_render_serve/frame_source
 import ./isonim_render_serve/diff_region
 import ./isonim_render_serve/stub_frame_source
 import ./isonim_render_serve/bridge
+import ./isonim_render_serve/element_tree_attrs
 
 export packet, ws_frame, event_dispatch, frame_source, diff_region,
-       stub_frame_source, bridge
+       stub_frame_source, bridge, element_tree_attrs
 
 when isMainModule:
   import std/[asyncdispatch, nativesockets, os, strutils]

@@ -53,6 +53,7 @@ import isonim_freya/renderer
 
 import ../frame_source
 import ../packet
+import ../element_tree_attrs
 
 type
   FreyaFrameSource* = ref object
@@ -63,8 +64,20 @@ type
 # ---------------------------------------------------------------------------
 # Layout heuristic: pack the element tree into stacked rectangles.
 # ---------------------------------------------------------------------------
+#
+# RS-M11b: the layout pass MUST be the single source of truth for both
+# the rasteriser AND the element-tree manifest builder. Mirror of the
+# GPUI adapter's setup — see ``gpui_adapter.nim`` for the rationale.
 
 type
+  LayoutRect* = object
+    ## Per-node layout entry. Pure geometry + identity; colour /
+    ## alpha live in the rasteriser's local ``Rect``.
+    node*: FreyaElement
+    x*, y*, w*, h*: int
+    depth*: int
+    tag*, label*: string
+
   Rect = object
     x, y, w, h: int
     r, g, b, a: uint8
@@ -102,21 +115,19 @@ proc colourForTag(tag, label: string): tuple[r, g, b: uint8] =
               uint8((h shr 8) and 0xFF),
               uint8((h shr 16) and 0xFF))
 
-proc layoutTree(node: FreyaElement; x, y, w, h: int;
-                rects: var seq[Rect]; depth = 0; maxDepth = 8) =
-  ## Walk the tree and stack each level vertically inside its
-  ## parent's rectangle. Depth-limited so degenerate trees can't
-  ## blow the stack. Produces one `Rect` per visited element.
+proc walkLayout(node: FreyaElement; x, y, w, h: int;
+                rects: var seq[LayoutRect]; depth = 0; maxDepth = 8) =
+  ## DFS that produces one ``LayoutRect`` per visited element. The
+  ## traversal order matches the F-packet rasteriser's drawing order
+  ## so the manifest's per-node bounds are byte-stable across re-emits.
   if node == nil or w <= 0 or h <= 0: return
   if depth > maxDepth: return
   let tag = getTag(node)
   let txt = textContent(node)
   let cls = getAttribute(node, "class")
   let label = txt & "|" & cls
-  let (cr, cg, cb) = colourForTag(tag, label)
-  let alpha = 0xFFu8 - uint8(min(depth * 16, 0xC0))
-  rects.add Rect(x: x, y: y, w: w, h: h,
-                 r: cr, g: cg, b: cb, a: alpha, label: label)
+  rects.add LayoutRect(node: node, x: x, y: y, w: w, h: h,
+                       depth: depth, tag: tag, label: label)
   let count = childCount(node)
   if count == 0: return
   # Reserve a small "header band" at the top so the parent's fill
@@ -133,8 +144,17 @@ proc layoutTree(node: FreyaElement; x, y, w, h: int;
     let ch =
       if i == count - 1: bodyY + bodyH - cy  # last child consumes remainder
       else: perChild
-    layoutTree(child, x + 4, cy, w - 8, ch, rects, depth + 1, maxDepth)
+    walkLayout(child, x + 4, cy, w - 8, ch, rects, depth + 1, maxDepth)
     cy += ch
+
+proc buildLayoutRects*(root: FreyaElement; width, height: int):
+                      seq[LayoutRect] =
+  ## Public layout pass. Same depth heuristic ``renderFrame`` uses, so
+  ## the rasteriser and the manifest builder share a single source of
+  ## truth for per-node geometry.
+  result = @[]
+  if root == nil or width <= 0 or height <= 0: return
+  walkLayout(root, 0, 0, width, height, result)
 
 # ---------------------------------------------------------------------------
 # Rasterizer: blit the rectangle list into an RGBA8888 row-major buffer.
@@ -185,10 +205,13 @@ proc renderFrame*(src: FreyaFrameSource): Frame =
     pixels[off + 2] = 0x18'u8
     pixels[off + 3] = 0xFF'u8
   if src.root != nil:
-    var rects: seq[Rect] = @[]
-    layoutTree(src.root, 0, 0, w, h, rects)
-    for r in rects:
-      fillRect(pixels, w, h, r)
+    let layoutRects = buildLayoutRects(src.root, w, h)
+    for lr in layoutRects:
+      let (cr, cg, cb) = colourForTag(lr.tag, lr.label)
+      let alpha = 0xFFu8 - uint8(min(lr.depth * 16, 0xC0))
+      fillRect(pixels, w, h, Rect(x: lr.x, y: lr.y, w: lr.w, h: lr.h,
+                                  r: cr, g: cg, b: cb, a: alpha,
+                                  label: lr.label))
   # Freya backend identifier strip — a 2-pixel purple band along the
   # bottom edge, applied AFTER the tree raster. Visually unobtrusive
   # but guarantees byte-distinct output vs GPUI / TUI / web for the
@@ -236,3 +259,35 @@ proc toAny*(src: FreyaFrameSource): AnyFrameSource =
       {.cast(gcsafe).}: captured.renderFrame(),
     closeImpl = proc() {.gcsafe.} =
       {.cast(gcsafe).}: captured.close())
+
+# ---------------------------------------------------------------------------
+# RS-M11b: element-tree manifest builder
+# ---------------------------------------------------------------------------
+##
+## Mirror of ``buildGpuiElementTreeManifest``. The two adapters share
+## attribute constants via ``isonim_render_serve/element_tree_attrs``;
+## the per-node walk uses each renderer's own tree-inspection API.
+
+proc buildFreyaElementTreeManifest*(root: FreyaElement;
+                                    width, height: int;
+                                    frameSeq: int = 0):
+                                   ElementTreeManifest =
+  ## Build a fresh manifest from the current state of the Freya tree
+  ## rooted at ``root``. Idempotent: same tree → same manifest, so the
+  ## bridge can hash the result and skip emission when unchanged.
+  result = ElementTreeManifest(
+    frameSeq: frameSeq,
+    surfaceWidth: width,
+    surfaceHeight: height,
+    elements: @[])
+  if root == nil or width <= 0 or height <= 0: return
+  let layoutRects = buildLayoutRects(root, width, height)
+  for lr in layoutRects:
+    let path = getAttribute(lr.node, ComponentPathAttr)
+    if path.len == 0: continue
+    let kind = getAttribute(lr.node, ElementKindAttr)
+    result.elements.add ElementEntry(
+      id: path,
+      componentPath: path,
+      kind: kind,
+      bounds: ElementBounds(x: lr.x, y: lr.y, w: lr.w, h: lr.h))

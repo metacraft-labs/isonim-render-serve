@@ -23,6 +23,13 @@ import isonim_tui/testing/harness
 
 import ../frame_source
 import ../packet
+import ../element_tree_attrs
+
+# RS-M11b: re-export the shared attribute names so existing call sites
+# that reach for them via ``tui_adapter`` (e.g. early RS-M11 launcher
+# code, tests) keep compiling. New code should import
+# ``isonim_render_serve/element_tree_attrs`` directly.
+export ComponentPathAttr, ElementKindAttr
 
 # ---------------------------------------------------------------------------
 # Bitmap font — 8x8 glyphs for printable ASCII 32..126.
@@ -385,9 +392,12 @@ proc toAny*(src: TuiFrameSource): AnyFrameSource =
 ##
 ## This is the pure-data half of the producer; the launcher wraps it
 ## in an `ElementTreeProvider` closure that captures the harness.
-
-const ComponentPathAttr* = "data-component-path"
-const ElementKindAttr* = "data-component-kind"
+##
+## RS-M11b: ``ComponentPathAttr`` / ``ElementKindAttr`` moved to the
+## shared ``isonim_render_serve/element_tree_attrs`` module so the
+## GPUI + Freya adapter twins consume the exact same strings; this
+## module re-exports them for backwards compatibility (see ``import``
+## block above).
 
 proc walkManifest(node: TerminalNode; c: Compositor; root: TerminalNode;
                   cellW, cellH: int; acc: var seq[ElementEntry]) =
