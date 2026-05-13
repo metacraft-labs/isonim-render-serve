@@ -19,11 +19,20 @@ import ./isonim_render_serve/event_dispatch
 import ./isonim_render_serve/frame_source
 import ./isonim_render_serve/diff_region
 import ./isonim_render_serve/stub_frame_source
-import ./isonim_render_serve/bridge
 import ./isonim_render_serve/element_tree_attrs
 
 export packet, ws_frame, event_dispatch, frame_source, diff_region,
-       stub_frame_source, bridge, element_tree_attrs
+       stub_frame_source, element_tree_attrs
+
+# The `bridge` module pulls `asyncdispatch` / `asynchttpserver` /
+# `nativesockets` / `os` and other POSIX-only symbols. `nim js`
+# cannot compile any of those, so we omit it under the JS target.
+# JS callers (e.g. the IsoNim Editor bundle) only need the codec
+# surfaces re-exported above; the bridge server logic is intrinsically
+# native-only.
+when not defined(js):
+  import ./isonim_render_serve/bridge
+  export bridge
 
 when isMainModule:
   import std/[asyncdispatch, nativesockets, os, strutils]

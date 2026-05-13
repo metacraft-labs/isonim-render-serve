@@ -75,8 +75,8 @@ proc encodeWsCloseFrame*(statusCode: uint16; reason: string = ""): string =
   var body = newString(2 + reason.len)
   body[0] = char(uint8((statusCode shr 8) and 0xFF))
   body[1] = char(uint8(statusCode and 0xFF))
-  if reason.len > 0:
-    copyMem(addr body[2], unsafeAddr reason[0], reason.len)
+  for i in 0 ..< reason.len:
+    body[2 + i] = reason[i]
   encodeWsFrame(wsOpClose, body)
 
 proc decodeCloseStatus*(payload: string): uint16 =
