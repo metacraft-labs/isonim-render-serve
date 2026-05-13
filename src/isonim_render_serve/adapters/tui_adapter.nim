@@ -14,9 +14,12 @@
 ## and feeds the rendered tree (TUI) / element tree (GPUI / Freya)
 ## to the bridge via the matching adapter.
 
-import std/[unicode]
+import std/[tables, unicode]
 
 import isonim_tui/cells
+import isonim_tui/renderer
+import isonim_tui/compositor
+import isonim_tui/testing/harness
 
 import ../frame_source
 import ../packet
@@ -367,3 +370,66 @@ proc toAny*(src: TuiFrameSource): AnyFrameSource =
       {.cast(gcsafe).}: captured.renderFrame(),
     closeImpl = proc() {.gcsafe.} =
       {.cast(gcsafe).}: captured.close())
+
+# ---------------------------------------------------------------------------
+# RS-M11 / EX-M23: element-tree manifest builder
+# ---------------------------------------------------------------------------
+##
+## `buildTuiElementTreeManifest` walks a TUI compositor's node tree in
+## DFS order, reads the `data-component-path` attribute set by the
+## launcher's Layer-1 leaves (see `task_app/tui/leaves.nim`), and
+## emits one `ElementEntry` per node with a non-empty component path
+## and a non-zero layout region. The cell-to-pixel transform uses the
+## same `cellW=8, cellH=12` defaults as the rasteriser so the
+## manifest's `bounds` match the surface dimensions of the F packet.
+##
+## This is the pure-data half of the producer; the launcher wraps it
+## in an `ElementTreeProvider` closure that captures the harness.
+
+const ComponentPathAttr* = "data-component-path"
+const ElementKindAttr* = "data-component-kind"
+
+proc walkManifest(node: TerminalNode; c: Compositor; root: TerminalNode;
+                  cellW, cellH: int; acc: var seq[ElementEntry]) =
+  ## DFS walker. Inserts an entry only when the node has a non-empty
+  ## `data-component-path` attribute AND `layoutRegionFor` returns a
+  ## non-zero rectangle.
+  if node == nil: return
+  if ComponentPathAttr in node.attributes:
+    let path = node.attributes[ComponentPathAttr]
+    if path.len > 0:
+      let region = layoutRegionFor(c, root, node.id)
+      if region.width > 0 and region.height > 0:
+        let kind =
+          if ElementKindAttr in node.attributes:
+            node.attributes[ElementKindAttr]
+          else:
+            ""
+        acc.add ElementEntry(
+          id: path,
+          componentPath: path,
+          kind: kind,
+          bounds: ElementBounds(
+            x: region.col * cellW,
+            y: region.row * cellH,
+            w: region.width * cellW,
+            h: region.height * cellH))
+  for child in node.children:
+    walkManifest(child, c, root, cellW, cellH, acc)
+
+proc buildTuiElementTreeManifest*(harness: TerminalTestHarness;
+                                  cols, rows: int;
+                                  cellW = 8; cellH = 12;
+                                  frameSeq: int = 0): ElementTreeManifest =
+  ## Build a fresh manifest from the harness's current compositor
+  ## state. Each `data-component-path`-annotated node becomes one
+  ## entry. Idempotent: same harness state → same manifest, so
+  ## callers can hash the result and skip emission when unchanged.
+  result = ElementTreeManifest(
+    frameSeq: frameSeq,
+    surfaceWidth: cols * cellW,
+    surfaceHeight: rows * cellH,
+    elements: @[])
+  if harness == nil or harness.root == nil: return
+  walkManifest(harness.root, harness.compositor, harness.root,
+               cellW, cellH, result.elements)

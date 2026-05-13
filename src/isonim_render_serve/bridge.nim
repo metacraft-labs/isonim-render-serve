@@ -51,6 +51,21 @@ const
     ## RS-M0 § "Error handling".
 
 type
+  ElementTreeProvider* = ref object
+    ## RS-M11: polymorphic handle the bridge consults to emit
+    ## element-tree manifests. The bridge calls `buildImpl` on
+    ## connect (right after `hello`, before the first F packet) and
+    ## again on every subsequent frame tick. The provider returns the
+    ## current manifest; the bridge compares against the per-
+    ## connection cache and emits an M packet only when the (id,
+    ## bounds) set has changed.
+    ##
+    ## Cadence policy lives on the bridge side, not the provider, so
+    ## a single provider can be observed by multiple concurrent
+    ## clients without colliding state. The provider stays a pure
+    ## "current value" handle.
+    buildImpl*: proc(): ElementTreeManifest {.closure, gcsafe.}
+
   BridgeConfig* = object
     port*: Port
     staticDir*: string
@@ -73,6 +88,13 @@ type
       ## See `frame_source.nim`'s module docstring for the design
       ## rationale (closure dispatch vs. concept-typed field vs.
       ## inheritance).
+    elementTree*: ElementTreeProvider
+      ## RS-M11: optional element-tree manifest producer. Nil for
+      ## launchers that don't advertise the `elementTree` capability;
+      ## non-nil for the TUI launcher (and future native-backend
+      ## launchers under RS-M11b/c). When set, the bridge advertises
+      ## `capabilities.elementTree = true` in the `hello` packet and
+      ## emits manifest M packets on connect + on change.
 
   Server* = ref object
     cfg*: BridgeConfig
@@ -103,15 +125,23 @@ proc readHeader(headers: HttpHeaders; key: string): string =
 # Hello builder
 # ---------------------------------------------------------------------------
 
-proc buildHelloJson*(backend: string; width, height: int): string =
+proc buildHelloJson*(backend: string; width, height: int;
+                     elementTree: bool = false): string =
   ## Build the JSON body for the mandatory first M packet. RS-M0
   ## locks the schema:
   ##   { type: "hello", protocolVersion: 1, backend, capabilities,
   ##     initialSize }
+  ##
+  ## RS-M11 adds the additive `elementTree` capability bit. The flag
+  ## is false by default so existing launchers compile unchanged;
+  ## launchers that emit element-tree manifests (TUI today; GPUI /
+  ## Freya / Cocoa / Android under RS-M11b/c) pass `true` to advertise
+  ## the capability.
   var caps = newJObject()
   caps["diffRegions"] = newJBool(true)    # RS-M3 advertises diff support
   caps["screenshot"] = newJBool(false)    # stub backend has none
   caps["hotReload"] = newJBool(false)
+  caps["elementTree"] = newJBool(elementTree)
   caps["inputKinds"] = %* ["key", "mouse", "scroll", "resize", "focus"]
   var size = newJObject()
   size["width"] = newJInt(width)
@@ -154,15 +184,58 @@ type
       ## compares against this on the next tick; `none` means the
       ## next frame must be sent in full (e.g. first frame on the
       ## connection, or after a size change invalidates the cache).
+    elementTreeKey: string
+      ## RS-M11: hash key of the last manifest emitted on this
+      ## connection. Empty string means "no manifest sent yet"; the
+      ## bridge always emits the first manifest after `hello` and
+      ## before the first F packet.
+
+proc manifestKey(m: ElementTreeManifest): string =
+  ## Stable hash key over the (id, bounds) tuples of the manifest's
+  ## elements plus the surface dimensions. The bridge compares this
+  ## against `ConnectionState.elementTreeKey` and emits only on
+  ## change (RS-M11 cadence rule).
+  result = $m.surfaceWidth & 'x' & $m.surfaceHeight & '|'
+  for e in m.elements:
+    result.add e.id
+    result.add ':'
+    result.add $e.bounds.x
+    result.add ','
+    result.add $e.bounds.y
+    result.add ','
+    result.add $e.bounds.w
+    result.add ','
+    result.add $e.bounds.h
+    result.add ';'
 
 proc sendHello(client: AsyncSocket; cfg: BridgeConfig;
                state: ConnectionState) {.async.} =
   let body = buildHelloJson(cfg.backend,
                             cfg.frameSource.width,
-                            cfg.frameSource.height)
+                            cfg.frameSource.height,
+                            elementTree = cfg.elementTree != nil)
   let meta = MetaPacket(json: body)
   await sendBinary(client, encodeMeta(meta))
   state.helloSent = true
+
+proc sendElementTreeIfChanged(client: AsyncSocket; cfg: BridgeConfig;
+                              state: ConnectionState;
+                              force: bool = false) {.async.} =
+  ## RS-M11 cadence: emit an `element-tree` M packet when (a) we
+  ## haven't yet sent one on this connection (force=true on first
+  ## emission), or (b) the (id, bounds) set has changed since the
+  ## last emission. Idle frames produce identical manifests and
+  ## therefore NO emission — that is the headline cadence invariant.
+  if cfg.elementTree == nil: return
+  let manifest = cfg.elementTree.buildImpl()
+  let key = manifestKey(manifest)
+  if not force and key == state.elementTreeKey: return
+  let meta = encodeElementTreeMeta(manifest)
+  try:
+    await sendBinary(client, encodeMeta(meta))
+    state.elementTreeKey = key
+  except OSError, IOError:
+    discard
 
 proc buildOutgoingFrame(curr: Frame; state: ConnectionState): Frame =
   ## RS-M3 outgoing-frame policy:
@@ -206,6 +279,12 @@ proc frameLoop(client: AsyncSocket; cfg: BridgeConfig;
     if not state.helloSent:
       await sleepAsync(5)
       continue
+    # RS-M11: re-check the element-tree manifest each tick BEFORE
+    # rendering the frame. If the (id, bounds) set has changed we
+    # emit a fresh manifest; otherwise the cadence rule skips the
+    # M packet so idle frame streams do not churn manifests.
+    if cfg.elementTree != nil:
+      await sendElementTreeIfChanged(client, cfg, state)
     let curr = cfg.frameSource.renderFrame()
     let outFrame = buildOutgoingFrame(curr, state)
     try:
@@ -296,8 +375,13 @@ proc handleInbound(client: AsyncSocket; cfg: BridgeConfig;
 
 proc bridgeOnce(client: AsyncSocket; cfg: BridgeConfig) {.async.} =
   let state = ConnectionState(helloSent: false, closed: false,
-                              lastSentFrame: none(Frame))
+                              lastSentFrame: none(Frame),
+                              elementTreeKey: "")
   await sendHello(client, cfg, state)
+  # RS-M11: the manifest MUST land before the first F packet so the
+  # editor's canvas can hit-test the very first pixel-rendered frame.
+  if cfg.elementTree != nil:
+    await sendElementTreeIfChanged(client, cfg, state, force = true)
   let outFut = frameLoop(client, cfg, state)
   let inFut = handleInbound(client, cfg, state)
   await outFut or inFut

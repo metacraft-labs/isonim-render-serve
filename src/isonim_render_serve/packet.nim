@@ -25,6 +25,8 @@
 ## u32 w, u32 h, u32 length, RGBA bytes }`. Each rect's `length`
 ## MUST equal `w * h * 4`.
 
+import std/[json, strutils]
+
 type
   PacketKind* = enum
     pkFrame = 'F'
@@ -270,3 +272,184 @@ proc peekPacketKind*(bytes: openArray[byte]): PacketKind =
   else:
     raise newException(PacketProtocolError,
       "unknown packet tag 0x" & $bytes[0])
+
+# ---------------------------------------------------------------------------
+# RS-M11: element-tree manifest sub-kind
+# ---------------------------------------------------------------------------
+##
+## The element-tree M sub-kind announces the layout-bound, hit-testable
+## element list for the current surface. The wire shape (with the
+## containing M packet stripped) is:
+##
+##   {
+##     "type": "element-tree",
+##     "frameSeq": <u32>,
+##     "surfaceWidth": <u32>,
+##     "surfaceHeight": <u32>,
+##     "elements": [
+##       { "id": <string>,
+##         "componentPath": <string>,
+##         "kind": <string>,
+##         "bounds": { "x": <u32>, "y": <u32>,
+##                     "w": <u32>, "h": <u32> } },
+##       ...
+##     ]
+##   }
+##
+## The JSON is wrapped in a standard M packet via `encodeMeta`; the
+## helpers below produce / decode the body shape only.
+
+type
+  ElementBounds* = object
+    ## Pixel-space bounding rectangle of a manifest entry. The
+    ## launcher converts cell coordinates to surface pixels before
+    ## emission so the editor never needs to know the renderer's
+    ## native unit.
+    x*, y*, w*, h*: int
+
+  ElementEntry* = object
+    ## One row in the element-tree manifest. `id` is launcher-stable
+    ## (the editor uses it for selection identity); `componentPath`
+    ## is the path the editor's selection signal should report; `kind`
+    ## is a free-form launcher hint used for tie-breaking and
+    ## diagnostics; `bounds` is the on-surface rectangle that the
+    ## editor's `elementAt(x, y)` helper hit-tests.
+    id*: string
+    componentPath*: string
+    kind*: string
+    bounds*: ElementBounds
+
+  ElementTreeManifest* = object
+    ## Top-level container for one `element-tree` emission. Pairs
+    ## with the F packet sequence number `frameSeq` so the editor can
+    ## drop manifests that arrive late after a resize.
+    frameSeq*: int
+    surfaceWidth*, surfaceHeight*: int
+    elements*: seq[ElementEntry]
+
+proc encodeElementTreeJson*(m: ElementTreeManifest): string =
+  ## Build the JSON body for an element-tree M packet using a
+  ## hand-rolled stable serializer. We avoid `std/json` here so the
+  ## byte layout is fully deterministic across compiler / Nim
+  ## versions (object-key order, integer formatting, no whitespace) —
+  ## the round-trip test pins this exact shape so future codec edits
+  ## can't silently shift the wire bytes.
+  proc escape(s: string): string =
+    result = newStringOfCap(s.len + 2)
+    result.add '"'
+    for ch in s:
+      case ch
+      of '\\': result.add "\\\\"
+      of '"': result.add "\\\""
+      of '\b': result.add "\\b"
+      of '\f': result.add "\\f"
+      of '\n': result.add "\\n"
+      of '\r': result.add "\\r"
+      of '\t': result.add "\\t"
+      else:
+        if ch.uint8 < 0x20'u8:
+          const hexChars = "0123456789abcdef"
+          result.add "\\u00"
+          result.add hexChars[int(ch.uint8 shr 4)]
+          result.add hexChars[int(ch.uint8 and 0x0F'u8)]
+        else:
+          result.add ch
+    result.add '"'
+
+  result = newStringOfCap(64 + 96 * m.elements.len)
+  result.add "{\"type\":\"element-tree\""
+  result.add ",\"frameSeq\":"
+  result.add $m.frameSeq
+  result.add ",\"surfaceWidth\":"
+  result.add $m.surfaceWidth
+  result.add ",\"surfaceHeight\":"
+  result.add $m.surfaceHeight
+  result.add ",\"elements\":["
+  for i, e in m.elements:
+    if i > 0: result.add ','
+    result.add "{\"id\":"
+    result.add escape(e.id)
+    result.add ",\"componentPath\":"
+    result.add escape(e.componentPath)
+    result.add ",\"kind\":"
+    result.add escape(e.kind)
+    result.add ",\"bounds\":{\"x\":"
+    result.add $e.bounds.x
+    result.add ",\"y\":"
+    result.add $e.bounds.y
+    result.add ",\"w\":"
+    result.add $e.bounds.w
+    result.add ",\"h\":"
+    result.add $e.bounds.h
+    result.add "}}"
+  result.add "]}"
+
+proc encodeElementTreeMeta*(m: ElementTreeManifest): MetaPacket =
+  ## Helper: wrap the manifest in a `MetaPacket` (the bridge's
+  ## `sendBinary` consumes that directly). The byte-on-wire shape is
+  ## the standard M packet plus the JSON body produced by
+  ## `encodeElementTreeJson`.
+  MetaPacket(json: encodeElementTreeJson(m))
+
+proc decodeElementTreeJson*(body: string): ElementTreeManifest =
+  ## Decode the JSON body of an element-tree M packet. Raises
+  ## `PacketProtocolError` on shape violations (missing required
+  ## fields, wrong `type`).
+  var node: JsonNode
+  try:
+    node = parseJson(body)
+  except JsonParsingError, ValueError:
+    raise newException(PacketProtocolError,
+      "element-tree body is not valid JSON")
+  if node.kind != JObject:
+    raise newException(PacketProtocolError,
+      "element-tree body is not a JSON object")
+  if not node.hasKey("type") or node["type"].kind != JString or
+      node["type"].getStr != "element-tree":
+    raise newException(PacketProtocolError,
+      "element-tree body has wrong type")
+  template intField(name: string): int =
+    if not node.hasKey(name) or node[name].kind != JInt:
+      raise newException(PacketProtocolError,
+        "element-tree body missing int field: " & name)
+    node[name].getInt
+  result.frameSeq = intField("frameSeq")
+  result.surfaceWidth = intField("surfaceWidth")
+  result.surfaceHeight = intField("surfaceHeight")
+  if not node.hasKey("elements") or node["elements"].kind != JArray:
+    raise newException(PacketProtocolError,
+      "element-tree body missing elements array")
+  for raw in node["elements"]:
+    if raw.kind != JObject:
+      raise newException(PacketProtocolError,
+        "element-tree entry is not an object")
+    template strField(host: JsonNode; name: string): string =
+      if not host.hasKey(name) or host[name].kind != JString:
+        raise newException(PacketProtocolError,
+          "element-tree entry missing string field: " & name)
+      host[name].getStr
+    var entry: ElementEntry
+    entry.id = strField(raw, "id")
+    entry.componentPath = strField(raw, "componentPath")
+    entry.kind = strField(raw, "kind")
+    if not raw.hasKey("bounds") or raw["bounds"].kind != JObject:
+      raise newException(PacketProtocolError,
+        "element-tree entry missing bounds object")
+    let b = raw["bounds"]
+    template intB(name: string): int =
+      if not b.hasKey(name) or b[name].kind != JInt:
+        raise newException(PacketProtocolError,
+          "element-tree bounds missing int field: " & name)
+      b[name].getInt
+    entry.bounds = ElementBounds(
+      x: intB("x"), y: intB("y"), w: intB("w"), h: intB("h"))
+    result.elements.add entry
+
+proc isElementTreeBody*(body: string): bool =
+  ## Cheap probe for the dispatcher in the bridge / editor: returns
+  ## true if the JSON body's `type` field is `"element-tree"`. Used
+  ## by code paths that decode the M body once and route by sub-kind.
+  # We avoid a full parse — a substring scan is sufficient for the
+  # dispatcher hot path. Editor / test callers can defer to
+  # `decodeElementTreeJson` for full validation.
+  body.contains("\"type\":\"element-tree\"")
