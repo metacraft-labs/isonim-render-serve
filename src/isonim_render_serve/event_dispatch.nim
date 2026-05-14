@@ -12,13 +12,18 @@ import ./packet
 
 type
   InputEventKind* = enum
-    iekKey, iekMouse, iekScroll, iekResize, iekFocus
+    iekKey, iekMouse, iekScroll, iekResize, iekFocus,
+    iekSelectStory, iekApplyMutation
 
   Modifiers* = object
     ctrl*, shift*, alt*, meta*: bool
 
   KeyAction* = enum kaDown, kaUp, kaPress
   MouseAction* = enum maDown, maUp, maMove, maClick
+
+  MutationScope* = enum
+    msLocal = "local"
+    msShared = "shared"
 
   InputEvent* = object
     case kind*: InputEventKind
@@ -40,6 +45,32 @@ type
       width*, height*: int
     of iekFocus:
       focused*: bool
+    of iekSelectStory:
+      ## RS-M12. Editor → launcher: "the user picked this story; tear
+      ## down the current root and mount the one keyed by ``storyId``".
+      ## ``storyId`` is the canonical ``"<group> / <name>"`` identifier
+      ## from ``task_app/core/story_ids.nim`` /
+      ## ``settings_app/core/story_ids.nim``. ``group`` / ``name`` /
+      ## ``storyKind`` carry the raw editor sidebar coordinates so the
+      ## launcher can log / diagnose lookups without re-splitting the
+      ## composite id. ``properties`` is the per-story configuration
+      ## bag (optional; ``nil`` means "use the story's defaults").
+      storyId*: string
+      storyGroup*: string
+      storyName*: string
+      storyKind*: string
+      properties*: JsonNode
+    of iekApplyMutation:
+      ## RS-M12. Editor → launcher: "the inspector committed an edit;
+      ## apply ``(key, value)`` to the component at ``target``". The
+      ## ``target`` string uses the same componentPath taxonomy the
+      ## element-tree manifest emits (e.g.
+      ## ``settings_app/views/Toggle#DarkMode``). ``scope`` mirrors
+      ## the editor's ``pesLocal`` / ``pesShared`` distinction.
+      mutationTarget*: string
+      mutationKey*: string
+      mutationValue*: JsonNode
+      mutationScope*: MutationScope
 
   InputSink* = concept sink
     sink.submit(event: InputEvent)
@@ -140,6 +171,56 @@ proc decodeInputEvent*(inp: InputPacket): InputEvent =
     if "focused" notin node or node["focused"].kind != JBool:
       raise newException(PacketProtocolError, "focus: missing focused")
     result = InputEvent(kind: iekFocus, focused: node["focused"].getBool)
+  of "select-story":
+    ## RS-M12. ``select-story`` lays out as
+    ## ``{type, group, name, kind, storyId, properties?}``. The four
+    ## string fields are required; ``properties`` is optional (nil
+    ## when the editor wants the launcher to fall back to per-story
+    ## defaults).
+    template strField(name: string): string =
+      if name notin node or node[name].kind != JString:
+        raise newException(PacketProtocolError,
+          "select-story: missing string field '" & name & "'")
+      node[name].getStr
+    let props =
+      if "properties" in node and node["properties"].kind != JNull:
+        node["properties"]
+      else:
+        nil
+    result = InputEvent(kind: iekSelectStory,
+      storyGroup: strField("group"),
+      storyName: strField("name"),
+      storyKind: strField("kind"),
+      storyId: strField("storyId"),
+      properties: props)
+  of "apply-mutation":
+    ## RS-M12. ``apply-mutation`` lays out as
+    ## ``{type, target, key, value, scope}``. ``value`` is an arbitrary
+    ## JSON node (number / bool / string / object) — the launcher
+    ## dispatches per (target, key) and is responsible for type
+    ## coercion. ``scope`` is the string ``"local"`` or ``"shared"``;
+    ## anything else surfaces as a protocol violation.
+    template strField(name: string): string =
+      if name notin node or node[name].kind != JString:
+        raise newException(PacketProtocolError,
+          "apply-mutation: missing string field '" & name & "'")
+      node[name].getStr
+    if "value" notin node:
+      raise newException(PacketProtocolError,
+        "apply-mutation: missing 'value'")
+    let scopeStr = strField("scope")
+    let scope =
+      case scopeStr
+      of "local": msLocal
+      of "shared": msShared
+      else:
+        raise newException(PacketProtocolError,
+          "apply-mutation: unknown scope '" & scopeStr & "'")
+    result = InputEvent(kind: iekApplyMutation,
+      mutationTarget: strField("target"),
+      mutationKey: strField("key"),
+      mutationValue: node["value"],
+      mutationScope: scope)
   else:
     raise newException(PacketProtocolError,
       "unknown I JSON type: " & kind)
@@ -197,7 +278,98 @@ proc encodeInputEvent*(ev: InputEvent): InputPacket =
   of iekFocus:
     node["type"] = newJString("focus")
     node["focused"] = newJBool(ev.focused)
+  of iekSelectStory:
+    node["type"] = newJString("select-story")
+    node["group"] = newJString(ev.storyGroup)
+    node["name"] = newJString(ev.storyName)
+    node["kind"] = newJString(ev.storyKind)
+    node["storyId"] = newJString(ev.storyId)
+    if ev.properties != nil:
+      node["properties"] = ev.properties
+  of iekApplyMutation:
+    node["type"] = newJString("apply-mutation")
+    node["target"] = newJString(ev.mutationTarget)
+    node["key"] = newJString(ev.mutationKey)
+    if ev.mutationValue != nil:
+      node["value"] = ev.mutationValue
+    else:
+      node["value"] = newJNull()
+    node["scope"] = newJString($ev.mutationScope)
   result = InputPacket(json: $node)
+
+# ---------------------------------------------------------------------------
+# RS-M12: stable, hand-rolled JSON serializer for the two new sub-kinds.
+# Used by the editor's JS-side WebSocket send paths AND by the launcher-
+# side reference encoding in the round-trip test, so the on-wire bytes
+# are deterministic across Nim versions / std/json key ordering.
+# ---------------------------------------------------------------------------
+
+proc jsonEscape(s: string): string =
+  ## Minimal RFC 8259 string escaper — sufficient for ASCII content
+  ## the editor emits today (componentPaths, story names, property
+  ## keys). Mirrors ``encodeElementTreeJson``'s escaper in packet.nim
+  ## so RS-M12's JSON shape stays consistent with RS-M11's.
+  result = newStringOfCap(s.len + 2)
+  result.add '"'
+  for ch in s:
+    case ch
+    of '\\': result.add "\\\\"
+    of '"': result.add "\\\""
+    of '\b': result.add "\\b"
+    of '\f': result.add "\\f"
+    of '\n': result.add "\\n"
+    of '\r': result.add "\\r"
+    of '\t': result.add "\\t"
+    else:
+      if ch.uint8 < 0x20'u8:
+        const hexChars = "0123456789abcdef"
+        result.add "\\u00"
+        result.add hexChars[int(ch.uint8 shr 4)]
+        result.add hexChars[int(ch.uint8 and 0x0F'u8)]
+      else:
+        result.add ch
+  result.add '"'
+
+proc encodeSelectStoryJson*(storyGroup, storyName, storyKind,
+                            storyId: string;
+                            properties: JsonNode = nil): string =
+  ## Hand-rolled deterministic encoder for the ``select-story`` I-body.
+  ## Field order locked to ``type, group, name, kind, storyId,
+  ## properties?`` so the on-wire bytes are reproducible.
+  result = newStringOfCap(96 + storyId.len + storyGroup.len +
+                          storyName.len + storyKind.len)
+  result.add "{\"type\":\"select-story\""
+  result.add ",\"group\":"
+  result.add jsonEscape(storyGroup)
+  result.add ",\"name\":"
+  result.add jsonEscape(storyName)
+  result.add ",\"kind\":"
+  result.add jsonEscape(storyKind)
+  result.add ",\"storyId\":"
+  result.add jsonEscape(storyId)
+  if properties != nil:
+    result.add ",\"properties\":"
+    result.add $properties
+  result.add "}"
+
+proc encodeApplyMutationJson*(target, key: string; value: JsonNode;
+                              scope: MutationScope): string =
+  ## Hand-rolled deterministic encoder for the ``apply-mutation``
+  ## I-body. Field order locked to ``type, target, key, value, scope``.
+  result = newStringOfCap(96 + target.len + key.len)
+  result.add "{\"type\":\"apply-mutation\""
+  result.add ",\"target\":"
+  result.add jsonEscape(target)
+  result.add ",\"key\":"
+  result.add jsonEscape(key)
+  result.add ",\"value\":"
+  if value == nil:
+    result.add "null"
+  else:
+    result.add $value
+  result.add ",\"scope\":"
+  result.add jsonEscape($scope)
+  result.add "}"
 
 # ---------------------------------------------------------------------------
 # Buffer-backed InputSink used by the stub backend + integration tests.
@@ -225,6 +397,11 @@ proc submit*(sink: BufferedInputSink; event: InputEvent) =
     sink.log.add "resize " & $event.width & "x" & $event.height
   of iekFocus:
     sink.log.add "focus " & (if event.focused: "true" else: "false")
+  of iekSelectStory:
+    sink.log.add "select-story " & event.storyId
+  of iekApplyMutation:
+    sink.log.add "apply-mutation " & event.mutationTarget & " " &
+                 event.mutationKey & " scope=" & $event.mutationScope
 
 # Convenience: render the structured log into a single string for
 # test assertions.

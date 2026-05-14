@@ -20,9 +20,10 @@ import ./isonim_render_serve/frame_source
 import ./isonim_render_serve/diff_region
 import ./isonim_render_serve/stub_frame_source
 import ./isonim_render_serve/element_tree_attrs
+import ./isonim_render_serve/story_dispatch
 
 export packet, ws_frame, event_dispatch, frame_source, diff_region,
-       stub_frame_source, element_tree_attrs
+       stub_frame_source, element_tree_attrs, story_dispatch
 
 # The `bridge` module pulls `asyncdispatch` / `asynchttpserver` /
 # `nativesockets` / `os` and other POSIX-only symbols. `nim js`
