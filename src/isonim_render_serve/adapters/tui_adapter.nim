@@ -1,5 +1,16 @@
 ## RS-Mxx: TUI streaming adapter.
 ##
+## DEPRECATED at RS-M13. The pixel TUI path produced sparse-grey-dots
+## output on dark canvas — fundamentally low-fidelity. RS-M13 retires
+## it in favour of the native D/M/P terminal-stream transport in
+## ``isonim-tui-serve`` + xterm.js in the editor. The replacement
+## launcher is ``isonim-examples/editor/backends/tui_term.nim``; the
+## proxy route is ``/tui-bridge`` (port 8112). This module stays in
+## the tree for one release cycle so the legacy
+## ``isonim-examples-tui`` launcher (built under
+## ``just build-backends-dev-pixel-tui``) keeps compiling; new code
+## must NOT depend on it.
+##
 ## Rasterises an `isonim_tui` `ScreenBuffer` (as produced by a
 ## `TerminalTestHarness`) into an RGBA8888 frame so the WebSocket
 ## bridge can stream the headless terminal output to a browser
@@ -13,6 +24,8 @@
 ## now drives a real demo VM through its renderer's composition root
 ## and feeds the rendered tree (TUI) / element tree (GPUI / Freya)
 ## to the bridge via the matching adapter.
+
+{.deprecated: "Replaced by isonim-tui-serve transport in RS-M13.".}
 
 import std/[tables, unicode]
 
