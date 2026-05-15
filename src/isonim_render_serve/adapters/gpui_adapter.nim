@@ -47,6 +47,7 @@
 import std/hashes
 
 import isonim_gpui/renderer
+import isonim_gpui/bindings as gpui_bindings
 
 import ../frame_source
 import ../packet
@@ -177,11 +178,88 @@ proc fillRect(pixels: var seq[byte]; w, h: int; r: Rect) =
       pixels[off + 3] = 0xFF'u8
       off += 4
 
+proc renderSyntheticFrame(src: GpuiFrameSource): Frame
+proc renderHeadlessFrame(src: GpuiFrameSource): Frame
+
 proc renderFrame*(src: GpuiFrameSource): Frame =
   ## Walk the GPUI tree rooted at `src.root` and produce an RGBA8888
   ## frame of `src.width` × `src.height` pixels. Pure function w.r.t.
   ## the tree's current state — the same tree always yields the same
   ## pixel buffer (modulo a constant-time per-call advance: none).
+  ##
+  ## RS-M14 Phase 2: when the shim is built with `--features
+  ## gpui-headless` AND the binary is compiled with
+  ## `-d:useGpuiHeadless`, this proc routes through
+  ## `gpui_render_to_pixels` to obtain real GPUI pixels via Zed's
+  ## `HeadlessAppContext` + `Window::render_to_image`. Otherwise it
+  ## falls back to the pre-RS-M14 synthetic vertical-stack raster (see
+  ## `renderSyntheticFrame`). The fallback path is also used if the
+  ## headless render returns an error code — this gives the editor a
+  ## degraded but still-usable frame instead of a hard failure when
+  ## the renderer can't run (e.g. Linux: the pinned Zed revision's
+  ## `current_headless_renderer()` returns `None` on non-macOS, so
+  ## the headless path bails out with error code 2 and we fall
+  ## through to the synthetic stripes — RS-M14b owns the real Linux
+  ## headless story).
+  when defined(useGpuiHeadless):
+    let frame = renderHeadlessFrame(src)
+    if frame.pixels.len == src.width * src.height * 4:
+      return frame
+    # Fall through to synthetic on size mismatch / capture failure /
+    # platform without a headless renderer — same defence as the
+    # Rust-side `SizeMismatch` / `RendererUnavailable` error codes.
+  renderSyntheticFrame(src)
+
+proc renderHeadlessFrame(src: GpuiFrameSource): Frame =
+  ## Drive the shim's `gpui_render_to_pixels` entry point to obtain
+  ## RGBA8888 bytes from GPUI's real render pipeline (via Zed's
+  ## `HeadlessAppContext::with_platform` + `Window::render_to_image`).
+  ## The buffer is owned by the shim until `gpui_free_pixels` is
+  ## called, so we copy it into a Nim seq before returning.
+  ##
+  ## The frame still carries the same `FrameFlags` shape and obeys the
+  ## F-packet protocol (RS-M0): RGBA8888 row-major, non-premultiplied
+  ## sRGB, top row first.
+  let w = src.width
+  let h = src.height
+  if w <= 0 or h <= 0:
+    return Frame(kind: fkFull,
+                 flags: FrameFlags(isDiff: false, isVideo: false),
+                 width: w, height: h, pixels: @[])
+  # RS-M14 Phase 2: the headless `NimRootView` reads from the shim's
+  # global `ROOT_NODE_ID`. The streaming adapter builds the tree through
+  # the `GpuiRenderer.createElement` etc. API which does NOT route
+  # through `gpui_launch` (the path that normally sets the root). So we
+  # have to pin the root explicitly per frame — cheap, idempotent, and
+  # mirrors the design pattern of the windowed launch path.
+  gpui_bindings.gpui_set_root_element(src.root)
+  var outPtr: ptr uint8
+  var outLen: csize_t = 0
+  let rc = gpui_bindings.gpui_render_to_pixels(
+    cuint(w), cuint(h), cfloat(1.0),
+    addr outPtr, addr outLen)
+  if rc != 0 or outPtr.isNil or outLen == 0:
+    # Headless render failed; caller falls back to synthetic.
+    return Frame(kind: fkFull,
+                 flags: FrameFlags(isDiff: false, isVideo: false),
+                 width: w, height: h, pixels: @[])
+  defer:
+    gpui_bindings.gpui_free_pixels(outPtr, outLen)
+  var pixels = newSeq[byte](int(outLen))
+  if pixels.len > 0:
+    copyMem(addr pixels[0], outPtr, int(outLen))
+  Frame(kind: fkFull,
+        flags: FrameFlags(isDiff: false, isVideo: false),
+        width: w, height: h, pixels: pixels)
+
+proc renderSyntheticFrame(src: GpuiFrameSource): Frame =
+  ## Pre-RS-M14 tree-derived synthetic raster. Kept as a fallback for
+  ## hosts where the headless GPUI surface isn't available (e.g.
+  ## Linux: the pinned Zed revision's headless renderer factory
+  ## returns `None` on non-macOS) and as the default for builds that
+  ## don't opt into `-d:useGpuiHeadless`. Documented behaviour:
+  ## colour-codes each tree node and packs them into a vertical stack
+  ## with a teal GPUI identifier band along the bottom edge.
   let w = src.width
   let h = src.height
   var pixels = newSeq[byte](w * h * 4)
