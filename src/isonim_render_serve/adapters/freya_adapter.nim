@@ -224,6 +224,15 @@ proc renderHeadlessFrame(src: FreyaFrameSource): Frame =
     return Frame(kind: fkFull,
                  flags: FrameFlags(isDiff: false, isVideo: false),
                  width: w, height: h, pixels: @[])
+  # RS-M14 Phase 1: the headless `shadow_tree_app` reads from the shim's
+  # global `ROOT_NODE_ID`. The streaming adapter builds the tree through
+  # the `FreyaRenderer.createElement` etc. API which does NOT route
+  # through `freya_launch` (the path that normally sets the root). So we
+  # have to pin the root explicitly per frame — cheap, idempotent, and
+  # mirrors the design pattern of the GPUI adapter (see RS-M14 Phase 2
+  # in `gpui_adapter.nim`). Without this call the shim returns its
+  # "No shadow tree root found" placeholder element.
+  freya_bindings.freya_set_root_element(src.root)
   var outPtr: ptr uint8
   var outLen: csize_t = 0
   let rc = freya_bindings.freya_render_to_pixels(

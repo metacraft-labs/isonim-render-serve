@@ -137,6 +137,21 @@ import isonim_cocoa/renderer
 
 when defined(macosx):
   import isonim_cocoa/appkit/capture as cocoa_capture
+  import isonim_cocoa/appkit/autolayout as cocoa_autolayout
+  import isonim_cocoa/appkit/views as cocoa_views
+  import isonim_cocoa/objc_runtime as cocoa_objc
+
+  # The macOS adapter body uses inline `{.emit:}` blocks (for the
+  # NSColor → CGColor → setBackgroundColor: dance below) that
+  # reference ``id``, ``SEL`` and ``objc_msgSend`` / ``sel_registerName``
+  # directly. Nim doesn't auto-include the AppKit / ObjC headers in
+  # the generated C file unless an emit-using proc forces it, so we
+  # add the include explicitly here. Matches the analogous module-
+  # level emit in ``isonim_cocoa/objc_runtime``.
+  {.emit: """
+#include <CoreGraphics/CGGeometry.h>
+#include <objc/message.h>
+""".}
 
 import ../frame_source
 import ../packet
@@ -170,6 +185,107 @@ when defined(macosx):
   ## row-by-row swizzle into canonical RGBA8888) in an ObjC `.m`
   ## helper (`isonim_cocoa/testing/capture_rgba.m`).
 
+  # -----------------------------------------------------------------
+  # Layout pass (M-EVP-14 fix)
+  # -----------------------------------------------------------------
+  ##
+  ## The IsoNim leaves wired through `CocoaRenderer` never call
+  ## `setFrame:` on the child NSViews, and the renderer itself only
+  ## emits AutoLayout constraints when the leaves set explicit
+  ## `width` / `height` styles (which the task_app / settings_app
+  ## leaves currently don't). The result: every NSView in the demo
+  ## tree comes up at the default ``CGRectZero`` origin / size,
+  ## ``cacheDisplayInRect:`` faithfully renders a 0x0 region for
+  ## each child, and the captured bitmap stays mostly empty (the
+  ## RGBA buffer is left as the calloc-zeroed ``(0,0,0,0)`` AppKit
+  ## handed back).
+  ##
+  ## Until the leaves grow explicit per-platform layout — or the
+  ## renderer learns to install AutoLayout constraints from the
+  ## shared view template — the adapter takes the same
+  ## vertical-stack heuristic ``buildLayoutRects`` already uses for
+  ## the element-tree manifest and pushes those rects down onto the
+  ## live NSViews via ``setFrame:``. Containers also get a layer-
+  ## backed background colour keyed to depth, so the headless
+  ## bitmap actually carries non-zero RGB and the editor's preview
+  ## canvas reflects the rendered demo instead of a black void.
+
+  proc setLayerBackgroundColor(view: cocoa_objc.Id;
+                                r, g, b, a: cdouble) =
+    ## Force ``view.wantsLayer = YES`` and stamp the layer's
+    ## ``backgroundColor`` with the requested sRGBA tuple. The
+    ## ``CocoaRenderer``'s ``applyStyle`` path normally does this on
+    ## demand when a leaf sets ``background-color``; the layout pass
+    ## below calls this directly for every container so an empty-
+    ## style demo still produces opaque pixels.
+    cocoa_views.setWantsLayer(view, true)
+    {.emit: """
+    id nsColor = ((id(*)(id, SEL, double, double, double, double))objc_msgSend)(
+      (id)objc_getClass("NSColor"),
+      sel_registerName("colorWithRed:green:blue:alpha:"),
+      `r`, `g`, `b`, `a`);
+    id layer = ((id(*)(id, SEL))objc_msgSend)(
+      (id)`view`, sel_registerName("layer"));
+    if (layer) {
+      void* cgColor = ((void*(*)(id, SEL))objc_msgSend)(
+        nsColor, sel_registerName("CGColor"));
+      ((void(*)(id, SEL, void*))objc_msgSend)(
+        layer, sel_registerName("setBackgroundColor:"), cgColor);
+    }
+    """.}
+
+  proc depthTint(depth: int): tuple[r, g, b, a: cdouble] =
+    ## Indigo-tinted palette keyed to tree depth so nested containers
+    ## remain visually distinct in the captured raster even when none
+    ## of the leaves set explicit colours. Matches the GPUI / Freya
+    ## adapters' "every container has a fill" idiom.
+    case depth mod 6
+    of 0: (0.094, 0.094, 0.137, 1.0)  # #181823 — outer shell
+    of 1: (0.137, 0.137, 0.196, 1.0)  # #232332
+    of 2: (0.184, 0.184, 0.247, 1.0)  # #2F2F3F
+    of 3: (0.486, 0.478, 0.929, 1.0)  # #7C7AED — accent
+    of 4: (0.231, 0.231, 0.302, 1.0)  # #3B3B4D
+    else: (0.165, 0.165, 0.220, 1.0)  # #2A2A38
+
+  proc isNilNode(e: CocoaElement): bool {.inline.} =
+    pointer(e) == nil
+
+  proc layoutTreeForCapture(r: CocoaRenderer; node: CocoaElement;
+                            x, y, w, h: int; depth = 0;
+                            maxDepth = 8) =
+    ## Vertical-stack layout pass that mirrors
+    ## ``buildLayoutRects`` but mutates the live NSView frames via
+    ## ``setFrame:`` instead of building a side-channel ``seq``.
+    ## Also stamps a depth-keyed layer background on every visited
+    ## node so empty containers still paint pixels.
+    if isNilNode(node) or w <= 0 or h <= 0: return
+    if depth > maxDepth: return
+    let view = cocoa_objc.Id(node)
+    cocoa_autolayout.setFrame(view, cdouble(x), cdouble(y),
+                              cdouble(w), cdouble(h))
+    let tint = depthTint(depth)
+    setLayerBackgroundColor(view, tint.r, tint.g, tint.b, tint.a)
+    let count = r.childCount(node)
+    if count == 0: return
+    let headerBand = min(12, max(0, h div 4))
+    let bodyY = headerBand
+    let bodyH = h - headerBand
+    if bodyH <= 0: return
+    let perChild = max(1, bodyH div count)
+    var cy = bodyY
+    for i in 0 ..< count:
+      let child = r.nthChild(node, i)
+      if isNilNode(child): continue
+      let ch =
+        if i == count - 1: bodyY + bodyH - cy  # last child consumes remainder
+        else: perChild
+      # Children are positioned in the parent's coordinate space; the
+      # captured bitmap renders the root, so the (x, y) here resets
+      # to the local origin (4-pixel inset to keep the parent's tint
+      # visible as a "card edge").
+      layoutTreeForCapture(r, child, 4, cy, w - 8, ch, depth + 1, maxDepth)
+      cy += ch
+
   proc renderFrame*(src: CocoaFrameSource): Frame =
     ## Capture the rendered Cocoa tree rooted at `src.root` into an
     ## RGBA8888 row-major frame of `src.width × src.height` pixels.
@@ -190,6 +306,13 @@ when defined(macosx):
     ## the AppKit-headless fidelity gap.
     let w = src.width
     let h = src.height
+    # M-EVP-14 fix: drive a vertical-stack layout pass over the live
+    # NSView tree before AppKit caches the display. Without this, the
+    # IsoNim leaves leave every child NSView at ``CGRectZero`` and the
+    # captured bitmap is left as the AppKit-zeroed ``(0,0,0,0)`` —
+    # i.e. a uniformly transparent / black surface. See the
+    # ``layoutTreeForCapture`` docstring for the full rationale.
+    layoutTreeForCapture(src.renderer, src.root, 0, 0, w, h)
     var pixels = cocoa_capture.captureViewRgba(Id(src.root), w, h)
     if pixels.len != w * h * 4:
       # The capture helper returns an empty seq on AppKit error
