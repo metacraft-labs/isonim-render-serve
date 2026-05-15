@@ -50,6 +50,7 @@
 import std/hashes
 
 import isonim_freya/renderer
+import isonim_freya/bindings as freya_bindings
 
 import ../frame_source
 import ../packet
@@ -181,18 +182,74 @@ proc fillRect(pixels: var seq[byte]; w, h: int; r: Rect) =
       pixels[off + 3] = 0xFF'u8
       off += 4
 
+proc renderSyntheticFrame(src: FreyaFrameSource): Frame
+proc renderHeadlessFrame(src: FreyaFrameSource): Frame
+
 proc renderFrame*(src: FreyaFrameSource): Frame =
   ## Walk the Freya tree rooted at `src.root` and produce an RGBA8888
   ## frame of `src.width` × `src.height` pixels. Pure function w.r.t.
   ## the tree's current state — the same tree always yields the same
   ## pixel buffer.
   ##
-  ## The canvas is initialised to a backend-identifier background tint
-  ## (a small Freya-purple band along the bottom) so the frame is
-  ## guaranteed byte-distinct from the GPUI adapter's output even when
-  ## the headless trees happen to project to identical rectangle
-  ## layouts (which is the common case because GPUI's tagMap collapses
-  ## the same HTML tag set onto a div-heavy vocabulary).
+  ## RS-M14 Phase 1: when the shim is built with `--features
+  ## freya-headless` AND the binary is compiled with
+  ## `-d:useFreyaHeadless`, this proc routes through
+  ## `freya_render_to_pixels` to obtain real Freya pixels via
+  ## `freya-testing`'s Skia raster path. Otherwise it falls back to
+  ## the pre-RS-M14 synthetic vertical-stack raster (see
+  ## `renderSyntheticFrame`). The fallback path is also used if the
+  ## headless render returns an error code — this gives the editor a
+  ## degraded but still-usable frame instead of a hard failure when
+  ## the layout engine can't run (e.g. Linux CI without fonts).
+  when defined(useFreyaHeadless):
+    let frame = renderHeadlessFrame(src)
+    if frame.pixels.len == src.width * src.height * 4:
+      return frame
+    # Fall through to synthetic on size mismatch — same defence as
+    # the Rust-side `SizeMismatch` error code.
+  renderSyntheticFrame(src)
+
+proc renderHeadlessFrame(src: FreyaFrameSource): Frame =
+  ## Drive the shim's `freya_render_to_pixels` entry point to obtain
+  ## RGBA8888 bytes from Freya's real render pipeline. The buffer is
+  ## owned by the shim until `freya_free_pixels` is called, so we
+  ## copy it into a Nim seq before returning.
+  ##
+  ## The frame still carries the same `FrameFlags` shape and obeys the
+  ## F-packet protocol (RS-M0): RGBA8888 row-major, non-premultiplied
+  ## sRGB, top row first.
+  let w = src.width
+  let h = src.height
+  if w <= 0 or h <= 0:
+    return Frame(kind: fkFull,
+                 flags: FrameFlags(isDiff: false, isVideo: false),
+                 width: w, height: h, pixels: @[])
+  var outPtr: ptr uint8
+  var outLen: csize_t = 0
+  let rc = freya_bindings.freya_render_to_pixels(
+    cuint(w), cuint(h), cfloat(1.0),
+    addr outPtr, addr outLen)
+  if rc != 0 or outPtr.isNil or outLen == 0:
+    # Headless render failed; caller falls back to synthetic.
+    return Frame(kind: fkFull,
+                 flags: FrameFlags(isDiff: false, isVideo: false),
+                 width: w, height: h, pixels: @[])
+  defer:
+    freya_bindings.freya_free_pixels(outPtr, outLen)
+  var pixels = newSeq[byte](int(outLen))
+  if pixels.len > 0:
+    copyMem(addr pixels[0], outPtr, int(outLen))
+  Frame(kind: fkFull,
+        flags: FrameFlags(isDiff: false, isVideo: false),
+        width: w, height: h, pixels: pixels)
+
+proc renderSyntheticFrame(src: FreyaFrameSource): Frame =
+  ## Pre-RS-M14 tree-derived synthetic raster. Kept as a fallback for
+  ## hosts where the headless Skia surface isn't available (e.g.
+  ## Linux CI without fonts wired up) and as the default for builds
+  ## that don't opt into `-d:useFreyaHeadless`. Documented behaviour:
+  ## colour-codes each tree node and packs them into a vertical stack
+  ## with a Freya-purple identifier band along the bottom edge.
   let w = src.width
   let h = src.height
   var pixels = newSeq[byte](w * h * 4)
