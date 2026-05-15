@@ -1,12 +1,5 @@
 ## RS-M4: Freya streaming adapter.
 ##
-## RS-M13b: DEPRECATED. The editor's default Freya launcher now ships
-## a `RenderTreeProvider` (see `freya_tree_adapter.nim`) and emits a
-## `render-tree` M sub-kind that the browser renders into a DOM
-## subtree. The pixel-rasterising adapter remains importable for one
-## release cycle via `just build-backends-dev-pixel-freya`.
-{.deprecated: "Replaced by freya_tree_adapter in RS-M13b. Use newFreyaRenderTreeProvider for the editor preview path.".}
-##
 ## Wraps a `FreyaRenderer` + root `FreyaElement` into the bridge's
 ## `AnyFrameSource` so the WebSocket bridge can stream the headless
 ## Freya tree to a browser canvas.

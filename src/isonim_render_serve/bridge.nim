@@ -66,19 +66,6 @@ type
     ## "current value" handle.
     buildImpl*: proc(): ElementTreeManifest {.closure, gcsafe.}
 
-  RenderTreeProvider* = ref object
-    ## RS-M13b: polymorphic handle the bridge consults to emit
-    ## ``render-tree`` M sub-kind packets. Same cadence policy as
-    ## ``ElementTreeProvider`` (first manifest on connect, re-emit on
-    ## tree-hash change). The provider returns the current value;
-    ## the bridge owns the per-connection key cache.
-    ##
-    ## When the bridge config also sets ``rendererSurface = "tree"``
-    ## the F-stream is skipped entirely — the render-tree IS the
-    ## presentation surface, and the editor renders DOM from the JSON
-    ## body alone.
-    buildImpl*: proc(): RenderTreeManifest {.closure, gcsafe.}
-
   BridgeConfig* = object
     port*: Port
     staticDir*: string
@@ -108,18 +95,6 @@ type
       ## launchers under RS-M11b/c). When set, the bridge advertises
       ## `capabilities.elementTree = true` in the `hello` packet and
       ## emits manifest M packets on connect + on change.
-    renderTree*: RenderTreeProvider
-      ## RS-M13b: optional render-tree manifest producer. Nil for
-      ## launchers that stay on the F-packet pixel surface (TUI,
-      ## Cocoa, Android, Web stub); non-nil for the GPUI / Freya
-      ## render-tree launchers. When set, the bridge advertises
-      ## `capabilities.renderTree = true` in the `hello` packet.
-    rendererSurface*: string
-      ## RS-M13b: capability flag in `hello.capabilities.rendererSurface`.
-      ## Default `""` (treated as legacy "pixels"); set to `"tree"` to
-      ## announce that the editor MUST skip the F-stream entirely and
-      ## render DOM from the render-tree manifest alone. The launcher
-      ## stops the F-loop when this is `"tree"`.
 
   Server* = ref object
     cfg*: BridgeConfig
@@ -151,9 +126,7 @@ proc readHeader(headers: HttpHeaders; key: string): string =
 # ---------------------------------------------------------------------------
 
 proc buildHelloJson*(backend: string; width, height: int;
-                     elementTree: bool = false;
-                     renderTree: bool = false;
-                     rendererSurface: string = ""): string =
+                     elementTree: bool = false): string =
   ## Build the JSON body for the mandatory first M packet. RS-M0
   ## locks the schema:
   ##   { type: "hello", protocolVersion: 1, backend, capabilities,
@@ -164,22 +137,11 @@ proc buildHelloJson*(backend: string; width, height: int;
   ## launchers that emit element-tree manifests (TUI today; GPUI /
   ## Freya / Cocoa / Android under RS-M11b/c) pass `true` to advertise
   ## the capability.
-  ##
-  ## RS-M13b adds two additive capability flags:
-  ##   * `renderTree` — non-nil RenderTreeProvider attached.
-  ##   * `rendererSurface` — `"pixels"` (default) or `"tree"`. When
-  ##     `"tree"`, the editor skips the F-stream entirely and renders
-  ##     DOM from the render-tree manifest.
   var caps = newJObject()
   caps["diffRegions"] = newJBool(true)    # RS-M3 advertises diff support
   caps["screenshot"] = newJBool(false)    # stub backend has none
   caps["hotReload"] = newJBool(false)
   caps["elementTree"] = newJBool(elementTree)
-  caps["renderTree"] = newJBool(renderTree)
-  let surface =
-    if rendererSurface.len > 0: rendererSurface
-    else: "pixels"
-  caps["rendererSurface"] = newJString(surface)
   caps["inputKinds"] = %* ["key", "mouse", "scroll", "resize", "focus"]
   var size = newJObject()
   size["width"] = newJInt(width)
@@ -227,10 +189,6 @@ type
       ## connection. Empty string means "no manifest sent yet"; the
       ## bridge always emits the first manifest after `hello` and
       ## before the first F packet.
-    renderTreeKey: string
-      ## RS-M13b: hash key of the last render-tree manifest emitted
-      ## on this connection. Same cadence semantics as
-      ## `elementTreeKey`. Empty string means "no manifest sent yet".
 
 proc manifestKey(m: ElementTreeManifest): string =
   ## Stable hash key over the (id, bounds) tuples of the manifest's
@@ -250,50 +208,12 @@ proc manifestKey(m: ElementTreeManifest): string =
     result.add $e.bounds.h
     result.add ';'
 
-proc renderTreeKey(m: RenderTreeManifest): string =
-  ## Stable hash key over a render-tree manifest. We walk the tree
-  ## depth-first, accumulating `(id, tag, text, style-keys-and-values,
-  ## bounds)` tuples so any change (text edit, style override, node
-  ## insert/remove, bounds shift) flips the key. The hash is the
-  ## same purpose `manifestKey` serves for element-tree.
-  proc walk(node: RenderTreeNode; buf: var string) =
-    buf.add node.id
-    buf.add '|'
-    buf.add node.tag
-    buf.add '|'
-    buf.add node.text
-    buf.add '|'
-    buf.add node.componentPath
-    buf.add '|'
-    for i in 0 ..< node.style.keys.len:
-      buf.add node.style.keys[i]
-      buf.add '='
-      buf.add node.style.values[i]
-      buf.add ';'
-    buf.add '|'
-    buf.add $node.bounds.x
-    buf.add ','
-    buf.add $node.bounds.y
-    buf.add ','
-    buf.add $node.bounds.w
-    buf.add ','
-    buf.add $node.bounds.h
-    buf.add "|["
-    for c in node.children:
-      walk(c, buf)
-      buf.add ','
-    buf.add "]"
-  result = m.rendererId & "::"
-  walk(m.root, result)
-
 proc sendHello(client: AsyncSocket; cfg: BridgeConfig;
                state: ConnectionState) {.async.} =
   let body = buildHelloJson(cfg.backend,
                             cfg.frameSource.width,
                             cfg.frameSource.height,
-                            elementTree = cfg.elementTree != nil,
-                            renderTree = cfg.renderTree != nil,
-                            rendererSurface = cfg.rendererSurface)
+                            elementTree = cfg.elementTree != nil)
   let meta = MetaPacket(json: body)
   await sendBinary(client, encodeMeta(meta))
   state.helloSent = true
@@ -314,24 +234,6 @@ proc sendElementTreeIfChanged(client: AsyncSocket; cfg: BridgeConfig;
   try:
     await sendBinary(client, encodeMeta(meta))
     state.elementTreeKey = key
-  except OSError, IOError:
-    discard
-
-proc sendRenderTreeIfChanged(client: AsyncSocket; cfg: BridgeConfig;
-                             state: ConnectionState;
-                             force: bool = false) {.async.} =
-  ## RS-M13b cadence: emit a `render-tree` M packet when (a) we
-  ## haven't yet sent one on this connection (force=true on first
-  ## emission), or (b) the tree hash has changed since the last
-  ## emission. Same cadence rule as the element-tree path.
-  if cfg.renderTree == nil: return
-  let manifest = cfg.renderTree.buildImpl()
-  let key = renderTreeKey(manifest)
-  if not force and key == state.renderTreeKey: return
-  let meta = encodeRenderTreeMeta(manifest)
-  try:
-    await sendBinary(client, encodeMeta(meta))
-    state.renderTreeKey = key
   except OSError, IOError:
     discard
 
@@ -372,15 +274,7 @@ proc frameLoop(client: AsyncSocket; cfg: BridgeConfig;
                state: ConnectionState) {.async.} =
   ## Push the stub source's frames at the configured cadence until
   ## either side hangs up (or `maxFrames` is reached, for the tests).
-  ##
-  ## RS-M13b: when ``rendererSurface == "tree"`` the launcher
-  ## advertises that pixels are not the presentation surface — the
-  ## editor renders DOM from the render-tree manifest alone. We skip
-  ## F-packet emission entirely in that branch, but still tick on the
-  ## frame-interval so render-tree change detection runs at the same
-  ## cadence as element-tree change detection.
   var sent = 0
-  let surfaceIsTree = cfg.rendererSurface == "tree"
   while not state.closed and not client.isClosed:
     if not state.helloSent:
       await sleepAsync(5)
@@ -391,18 +285,6 @@ proc frameLoop(client: AsyncSocket; cfg: BridgeConfig;
     # M packet so idle frame streams do not churn manifests.
     if cfg.elementTree != nil:
       await sendElementTreeIfChanged(client, cfg, state)
-    # RS-M13b: same cadence policy for the render-tree manifest.
-    if cfg.renderTree != nil:
-      await sendRenderTreeIfChanged(client, cfg, state)
-    if surfaceIsTree:
-      # Tree surface: the editor renders from the render-tree manifest
-      # alone; no pixel F-packets needed.
-      if cfg.maxFrames > 0:
-        inc sent
-        if sent >= cfg.maxFrames:
-          return
-      await sleepAsync(cfg.frameIntervalMs)
-      continue
     let curr = cfg.frameSource.renderFrame()
     let outFrame = buildOutgoingFrame(curr, state)
     try:
@@ -494,18 +376,12 @@ proc handleInbound(client: AsyncSocket; cfg: BridgeConfig;
 proc bridgeOnce(client: AsyncSocket; cfg: BridgeConfig) {.async.} =
   let state = ConnectionState(helloSent: false, closed: false,
                               lastSentFrame: none(Frame),
-                              elementTreeKey: "",
-                              renderTreeKey: "")
+                              elementTreeKey: "")
   await sendHello(client, cfg, state)
   # RS-M11: the manifest MUST land before the first F packet so the
   # editor's canvas can hit-test the very first pixel-rendered frame.
   if cfg.elementTree != nil:
     await sendElementTreeIfChanged(client, cfg, state, force = true)
-  # RS-M13b: the render-tree manifest MUST land before the first F
-  # packet too (or instead of it when `rendererSurface == "tree"`)
-  # so the editor's DOM-rendering path has content to mount.
-  if cfg.renderTree != nil:
-    await sendRenderTreeIfChanged(client, cfg, state, force = true)
   let outFut = frameLoop(client, cfg, state)
   let inFut = handleInbound(client, cfg, state)
   await outFut or inFut
