@@ -1,5 +1,13 @@
 ## RS-M2: GPUI streaming adapter.
 ##
+## RS-M13b: DEPRECATED. The editor's default GPUI launcher now ships
+## a `RenderTreeProvider` (see `gpui_tree_adapter.nim`) and emits a
+## `render-tree` M sub-kind that the browser renders into a DOM
+## subtree. This pixel-rasterising adapter remains importable for one
+## release cycle via `just build-backends-dev-pixel-gpui` so consumers
+## of the legacy pixel surface have a migration window.
+{.deprecated: "Replaced by gpui_tree_adapter in RS-M13b. Use newGpuiRenderTreeProvider for the editor preview path.".}
+##
 ## Wraps a `GpuiRenderer` + root `GpuiElement` into the
 ## bridge's `AnyFrameSource` so the WebSocket bridge can stream the
 ## headless GPUI tree to a browser canvas.
