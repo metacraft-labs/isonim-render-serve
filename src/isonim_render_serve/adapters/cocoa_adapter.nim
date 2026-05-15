@@ -205,10 +205,15 @@ when defined(macosx):
   ## shared view template — the adapter takes the same
   ## vertical-stack heuristic ``buildLayoutRects`` already uses for
   ## the element-tree manifest and pushes those rects down onto the
-  ## live NSViews via ``setFrame:``. Containers also get a layer-
-  ## backed background colour keyed to depth, so the headless
-  ## bitmap actually carries non-zero RGB and the editor's preview
-  ## canvas reflects the rendered demo instead of a black void.
+  ## live NSViews via ``setFrame:``. Containers that don't have an
+  ## explicit ``background-color`` style also get a neutral, dark-
+  ## grey layer fill keyed to depth so the headless bitmap carries
+  ## non-zero RGB and the editor's preview canvas reflects the
+  ## rendered demo instead of a black void. (M-EVP-14 round-3:
+  ## the earlier ``depthTint`` palette painted a saturated indigo
+  ## at depth 3, which clobbered the task_app's row layer and
+  ## inverted the visual hierarchy. Accent placement is now
+  ## delegated entirely to leaves' explicit styles.)
 
   proc setLayerBackgroundColor(view: cocoa_objc.Id;
                                 r, g, b, a: cdouble) =
@@ -234,56 +239,126 @@ when defined(macosx):
     }
     """.}
 
-  proc depthTint(depth: int): tuple[r, g, b, a: cdouble] =
-    ## Indigo-tinted palette keyed to tree depth so nested containers
-    ## remain visually distinct in the captured raster even when none
-    ## of the leaves set explicit colours. Matches the GPUI / Freya
-    ## adapters' "every container has a fill" idiom.
+  proc neutralTint(depth: int): tuple[r, g, b, a: cdouble] =
+    ## Neutral dark-grey palette keyed to tree depth. Every level
+    ## gets a slightly different shade so nested containers remain
+    ## visually distinct in the captured raster, but no level carries
+    ## an "accent" colour — accent / brand placement is delegated to
+    ## leaves' explicit ``background-color`` styles (M-EVP-14 round-3
+    ## fix: previously a depth-keyed indigo at depth 3 painted task
+    ## rows as primary CTAs, inverting the visual hierarchy).
     case depth mod 6
-    of 0: (0.094, 0.094, 0.137, 1.0)  # #181823 — outer shell
-    of 1: (0.137, 0.137, 0.196, 1.0)  # #232332
-    of 2: (0.184, 0.184, 0.247, 1.0)  # #2F2F3F
-    of 3: (0.486, 0.478, 0.929, 1.0)  # #7C7AED — accent
-    of 4: (0.231, 0.231, 0.302, 1.0)  # #3B3B4D
-    else: (0.165, 0.165, 0.220, 1.0)  # #2A2A38
+    of 0: (0.094, 0.094, 0.110, 1.0)  # #18181C — outer shell
+    of 1: (0.125, 0.125, 0.149, 1.0)  # #202025 — cards
+    of 2: (0.157, 0.157, 0.180, 1.0)  # #28282E — rows / sections
+    of 3: (0.196, 0.196, 0.220, 1.0)  # #323238 — row interior
+    of 4: (0.227, 0.227, 0.251, 1.0)  # #3A3A40 — labels band
+    else: (0.169, 0.169, 0.192, 1.0)  # #2B2B31 — fallback
 
   proc isNilNode(e: CocoaElement): bool {.inline.} =
     pointer(e) == nil
 
   proc layoutTreeForCapture(r: CocoaRenderer; node: CocoaElement;
+                            parentH: int;
                             x, y, w, h: int; depth = 0;
-                            maxDepth = 8) =
+                            maxDepth = 12;
+                            parentHasExplicitBg = false) =
     ## Vertical-stack layout pass that mirrors
     ## ``buildLayoutRects`` but mutates the live NSView frames via
     ## ``setFrame:`` instead of building a side-channel ``seq``.
-    ## Also stamps a depth-keyed layer background on every visited
+    ## Also stamps a neutral layer background on every visited
     ## node so empty containers still paint pixels.
+    ##
+    ## Coordinate system note (M-EVP-14 round-3 fix). NSView's
+    ## default ``isFlipped`` is ``NO`` — y grows upward from the
+    ## bottom-left origin. ``setFrame:`` interprets the rect's
+    ## ``origin.y`` in that bottom-up space. The layout walker here
+    ## thinks top-down (``y`` increases as we descend the DOM),
+    ## which means without a flip the captured bitmap shows the
+    ## children stacked in reverse: the last DOM child paints at the
+    ## visual top, the first child at the bottom. Round 2 of the
+    ## M-EVP-14 review caught this on task_app/cocoa ("summary on
+    ## top, input at bottom"). The fix: convert our top-down y into
+    ## NSView's bottom-up frame y by reflecting through the parent's
+    ## height: ``nsY = parentH - (layoutY + h)``. ``parentH`` is
+    ## threaded through the recursion so each child sees the right
+    ## parent height. The root is laid out against itself
+    ## (``parentH = h``).
+    ##
+    ## Sizing note. The previous heuristic reserved a ``headerBand``
+    ## of 12 px or h/4 inside every container, then distributed the
+    ## body height equally among children. For deeply-nested trees
+    ## (settings_app/cocoa: disclosure → section → header → label →
+    ## …) the header bands compound and squeeze the leaf labels
+    ## down to a few pixels. Round 2 caught this on settings_app
+    ## ("blank canvas"). The fix: only spend the header band on
+    ## non-leaf containers at depth <= 1; deeper levels fill their
+    ## parent edge-to-edge so leaf content gets the full slice.
+    ##
+    ## Tint precedence. The renderer marks
+    ## ``hasExplicitBackground`` inside ``applyStyle`` when a leaf
+    ## picks a brand / accent / status colour via ``setStyle``.
+    ## We skip the neutral fallback in two cases:
+    ##   1. The node itself has an explicit background.
+    ##   2. The node's parent has an explicit background — otherwise
+    ##      the children's neutral tint would obscure the parent's
+    ##      chosen colour. The macOS unit test
+    ##      (``test_cocoa_adapter_macos_only.nim``) raspberry root
+    ##      with two unstyled children exercises this propagation.
     if isNilNode(node) or w <= 0 or h <= 0: return
     if depth > maxDepth: return
     let view = cocoa_objc.Id(node)
-    cocoa_autolayout.setFrame(view, cdouble(x), cdouble(y),
+    # Convert our top-down y to NSView's bottom-up frame y.
+    let nsY = parentH - (y + h)
+    cocoa_autolayout.setFrame(view, cdouble(x), cdouble(nsY),
                               cdouble(w), cdouble(h))
-    let tint = depthTint(depth)
-    setLayerBackgroundColor(view, tint.r, tint.g, tint.b, tint.a)
+    let selfHasExplicitBg = r.hasExplicitBackground(node)
+    if not selfHasExplicitBg and not parentHasExplicitBg:
+      let tint = neutralTint(depth)
+      setLayerBackgroundColor(view, tint.r, tint.g, tint.b, tint.a)
     let count = r.childCount(node)
     if count == 0: return
-    let headerBand = min(12, max(0, h div 4))
+    # Only reserve a small header band at the outer layers so the
+    # parent's card-edge tint stays visible; deeper containers get
+    # 0 header band so the settings_app's nested label tree doesn't
+    # collapse to invisible.
+    let headerBand =
+      if depth <= 1: min(12, max(0, h div 8))
+      else: 0
     let bodyY = headerBand
     let bodyH = h - headerBand
     if bodyH <= 0: return
+    # Even distribution across children. Deeper levels (settings_app
+    # sections → headers → labels) need to distribute the available
+    # body height proportionally even when individual leaves are tiny;
+    # forcing a minimum would otherwise truncate the tail children.
+    # Round 2 caught task-row overlapping text — addressed at the leaf
+    # layer (``task_app/cocoa/leaves.nim`` sets a ``min-height: 48px``
+    # style hint) and by the no-header-band rule at depth > 1, which
+    # gives each task row its full body slice without losing pixels
+    # to compounded ``headerBand`` reservations.
     let perChild = max(1, bodyH div count)
     var cy = bodyY
+    # Propagate ``selfHasExplicitBg`` downward so unstyled descendants
+    # of a coloured node don't paint over the chosen colour.
+    let propagateBg = selfHasExplicitBg or parentHasExplicitBg
     for i in 0 ..< count:
       let child = r.nthChild(node, i)
       if isNilNode(child): continue
+      let remaining = bodyY + bodyH - cy
+      if remaining <= 0: break
       let ch =
-        if i == count - 1: bodyY + bodyH - cy  # last child consumes remainder
+        if i == count - 1: remaining
+        elif perChild > remaining: remaining
         else: perChild
-      # Children are positioned in the parent's coordinate space; the
-      # captured bitmap renders the root, so the (x, y) here resets
-      # to the local origin (4-pixel inset to keep the parent's tint
-      # visible as a "card edge").
-      layoutTreeForCapture(r, child, 4, cy, w - 8, ch, depth + 1, maxDepth)
+      if ch <= 0: break
+      # Children are positioned in the parent's local coordinate
+      # space (NSView's frame origin is relative to the immediate
+      # superview's bounds). The 4-pixel horizontal inset keeps the
+      # parent's tint visible as a card edge. Vertical insets are
+      # subsumed by the header band above.
+      layoutTreeForCapture(r, child, h, 4, cy, w - 8, ch,
+                           depth + 1, maxDepth, propagateBg)
       cy += ch
 
   proc renderFrame*(src: CocoaFrameSource): Frame =
@@ -312,7 +387,12 @@ when defined(macosx):
     # captured bitmap is left as the AppKit-zeroed ``(0,0,0,0)`` —
     # i.e. a uniformly transparent / black surface. See the
     # ``layoutTreeForCapture`` docstring for the full rationale.
-    layoutTreeForCapture(src.renderer, src.root, 0, 0, w, h)
+    #
+    # ``parentH`` for the root is the root's own height — the layout
+    # pass uses ``parentH`` to flip our top-down ``y`` into NSView's
+    # bottom-up frame y. With ``parentH = h`` the root's NS-y is 0,
+    # which is what we want for the capture target.
+    layoutTreeForCapture(src.renderer, src.root, h, 0, 0, w, h)
     var pixels = cocoa_capture.captureViewRgba(Id(src.root), w, h)
     if pixels.len != w * h * 4:
       # The capture helper returns an empty seq on AppKit error
