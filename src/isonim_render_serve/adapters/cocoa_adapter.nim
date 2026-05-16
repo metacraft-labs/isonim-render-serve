@@ -133,6 +133,8 @@
 ##      3rd-real adapter (alongside GPUI/Freya).
 ##   5. Flip the RS-M5 `:status:` from `partial-linux` to `complete`.
 
+import std/strutils
+
 import isonim_cocoa/renderer
 
 when defined(macosx):
@@ -258,16 +260,24 @@ when defined(macosx):
   proc isNilNode(e: CocoaElement): bool {.inline.} =
     pointer(e) == nil
 
+  proc parsePxAttr(s: string): int =
+    ## Parse an integer pixel attribute like "44" or "44px". Returns 0
+    ## when the value is empty or unparseable; the layout caller treats
+    ## 0 as "no fixed size, distribute flexibly".
+    if s.len == 0: return 0
+    var t = s
+    if t.endsWith("px"): t = t[0 ..< t.len - 2]
+    try: parseInt(t.strip()) except CatchableError: 0
+
   proc layoutTreeForCapture(r: CocoaRenderer; node: CocoaElement;
                             parentH: int;
                             x, y, w, h: int; depth = 0;
                             maxDepth = 12;
                             parentHasExplicitBg = false) =
-    ## Vertical-stack layout pass that mirrors
-    ## ``buildLayoutRects`` but mutates the live NSView frames via
-    ## ``setFrame:`` instead of building a side-channel ``seq``.
-    ## Also stamps a neutral layer background on every visited
-    ## node so empty containers still paint pixels.
+    ## Layout pass that mirrors ``buildLayoutRects`` but mutates the
+    ## live NSView frames via ``setFrame:`` instead of building a
+    ## side-channel ``seq``. Also stamps a neutral layer background on
+    ## every visited node so empty containers still paint pixels.
     ##
     ## Coordinate system note (M-EVP-14 round-3 fix). NSView's
     ## default ``isFlipped`` is ``NO`` — y grows upward from the
@@ -285,15 +295,22 @@ when defined(macosx):
     ## parent height. The root is laid out against itself
     ## (``parentH = h``).
     ##
-    ## Sizing note. The previous heuristic reserved a ``headerBand``
-    ## of 12 px or h/4 inside every container, then distributed the
-    ## body height equally among children. For deeply-nested trees
-    ## (settings_app/cocoa: disclosure → section → header → label →
-    ## …) the header bands compound and squeeze the leaf labels
-    ## down to a few pixels. Round 2 caught this on settings_app
-    ## ("blank canvas"). The fix: only spend the header band on
-    ## non-leaf containers at depth <= 1; deeper levels fill their
-    ## parent edge-to-edge so leaf content gets the full slice.
+    ## Layout direction (M-EVP-14 round-4 fix). The default is
+    ## vertical stacking — children flow top-to-bottom, each filling
+    ## the parent's width. A node tagged ``data-layout="horizontal"``
+    ## flows children left-to-right, each filling the parent's height.
+    ## This is how the task_app row gets the toggle / title / remove
+    ## glyphs side-by-side instead of stacked vertically.
+    ##
+    ## Fixed-size children (M-EVP-14 round-4 fix). When a child sets
+    ## ``data-fixed-height`` (vertical layout) or ``data-fixed-width``
+    ## (horizontal layout), the parent reserves that exact size and
+    ## distributes the remainder among the flexible siblings. This
+    ## lets the settings_app shell pin the disclosure triangle to a
+    ## thin band, the group header to ~44 px, and each item row to
+    ## ~44 px — leaving the previously-collapsed item rows with real
+    ## bitmap area instead of the prior equal-split which compounded
+    ## down to single-digit pixels per item.
     ##
     ## Tint precedence. The renderer marks
     ## ``hasExplicitBackground`` inside ``applyStyle`` when a leaf
@@ -318,48 +335,95 @@ when defined(macosx):
       setLayerBackgroundColor(view, tint.r, tint.g, tint.b, tint.a)
     let count = r.childCount(node)
     if count == 0: return
+    let isHorizontal = r.getAttribute(node, "data-layout") == "horizontal"
     # Only reserve a small header band at the outer layers so the
     # parent's card-edge tint stays visible; deeper containers get
     # 0 header band so the settings_app's nested label tree doesn't
-    # collapse to invisible.
+    # collapse to invisible. Header band is along the cross axis
+    # (top for vertical layout, left for horizontal).
     let headerBand =
-      if depth <= 1: min(12, max(0, h div 8))
+      if depth <= 1 and not isHorizontal: min(12, max(0, h div 8))
       else: 0
-    let bodyY = headerBand
-    let bodyH = h - headerBand
-    if bodyH <= 0: return
-    # Even distribution across children. Deeper levels (settings_app
-    # sections → headers → labels) need to distribute the available
-    # body height proportionally even when individual leaves are tiny;
-    # forcing a minimum would otherwise truncate the tail children.
-    # Round 2 caught task-row overlapping text — addressed at the leaf
-    # layer (``task_app/cocoa/leaves.nim`` sets a ``min-height: 48px``
-    # style hint) and by the no-header-band rule at depth > 1, which
-    # gives each task row its full body slice without losing pixels
-    # to compounded ``headerBand`` reservations.
-    let perChild = max(1, bodyH div count)
-    var cy = bodyY
-    # Propagate ``selfHasExplicitBg`` downward so unstyled descendants
-    # of a coloured node don't paint over the chosen colour.
-    let propagateBg = selfHasExplicitBg or parentHasExplicitBg
+    # Pre-pass: compute per-child fixed and flexible sizes along the
+    # layout axis. ``data-fixed-height`` is honoured under vertical
+    # layout, ``data-fixed-width`` under horizontal. Anything else is
+    # flexible and shares the leftover slice equally.
+    var fixedSizes = newSeq[int](count)
+    var fixedTotal = 0
+    var flexCount = 0
     for i in 0 ..< count:
       let child = r.nthChild(node, i)
-      if isNilNode(child): continue
-      let remaining = bodyY + bodyH - cy
-      if remaining <= 0: break
-      let ch =
-        if i == count - 1: remaining
-        elif perChild > remaining: remaining
-        else: perChild
-      if ch <= 0: break
-      # Children are positioned in the parent's local coordinate
-      # space (NSView's frame origin is relative to the immediate
-      # superview's bounds). The 4-pixel horizontal inset keeps the
-      # parent's tint visible as a card edge. Vertical insets are
-      # subsumed by the header band above.
-      layoutTreeForCapture(r, child, h, 4, cy, w - 8, ch,
-                           depth + 1, maxDepth, propagateBg)
-      cy += ch
+      if isNilNode(child):
+        fixedSizes[i] = 0
+        continue
+      let attr =
+        if isHorizontal: r.getAttribute(child, "data-fixed-width")
+        else: r.getAttribute(child, "data-fixed-height")
+      let s = parsePxAttr(attr)
+      fixedSizes[i] = s
+      if s > 0: fixedTotal += s
+      else: inc flexCount
+    let propagateBg = selfHasExplicitBg or parentHasExplicitBg
+    if isHorizontal:
+      # Horizontal layout: stack children left-to-right; each child
+      # fills the parent's height (minus 2 px vertical inset for a
+      # subtle parent-edge tint band). The 4 px horizontal inset is
+      # subsumed into the parent's start/end gutters by giving each
+      # child the parent's full width slice.
+      let bodyW = w
+      if bodyW <= 0: return
+      let flexTotal = max(0, bodyW - fixedTotal)
+      let perFlex = if flexCount > 0: max(1, flexTotal div flexCount) else: 0
+      var cx = 0
+      let childY = 2
+      let childH = max(1, h - 4)
+      for i in 0 ..< count:
+        let child = r.nthChild(node, i)
+        if isNilNode(child): continue
+        let remaining = bodyW - cx
+        if remaining <= 0: break
+        let cw =
+          if fixedSizes[i] > 0:
+            min(fixedSizes[i], remaining)
+          elif i == count - 1:
+            remaining
+          elif perFlex > remaining:
+            remaining
+          else:
+            perFlex
+        if cw <= 0: break
+        layoutTreeForCapture(r, child, h, cx, childY, cw, childH,
+                             depth + 1, maxDepth, propagateBg)
+        cx += cw
+    else:
+      let bodyY = headerBand
+      let bodyH = h - headerBand
+      if bodyH <= 0: return
+      let flexTotal = max(0, bodyH - fixedTotal)
+      let perFlex = if flexCount > 0: max(1, flexTotal div flexCount) else: 0
+      var cy = bodyY
+      for i in 0 ..< count:
+        let child = r.nthChild(node, i)
+        if isNilNode(child): continue
+        let remaining = bodyY + bodyH - cy
+        if remaining <= 0: break
+        let ch =
+          if fixedSizes[i] > 0:
+            min(fixedSizes[i], remaining)
+          elif i == count - 1:
+            remaining
+          elif perFlex > remaining:
+            remaining
+          else:
+            perFlex
+        if ch <= 0: break
+        # Children are positioned in the parent's local coordinate
+        # space (NSView's frame origin is relative to the immediate
+        # superview's bounds). The 4-pixel horizontal inset keeps the
+        # parent's tint visible as a card edge.
+        layoutTreeForCapture(r, child, h, 4, cy, w - 8, ch,
+                             depth + 1, maxDepth, propagateBg)
+        cy += ch
 
   proc renderFrame*(src: CocoaFrameSource): Frame =
     ## Capture the rendered Cocoa tree rooted at `src.root` into an
