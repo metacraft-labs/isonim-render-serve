@@ -217,6 +217,120 @@ when defined(macosx):
   ## inverted the visual hierarchy. Accent placement is now
   ## delegated entirely to leaves' explicit styles.)
 
+  proc walkApplyDarkAppearance(view: cocoa_objc.Id;
+                               darkAppearance: cocoa_objc.Id) =
+    ## Apply the dark NSAppearance to ``view`` (when the view responds
+    ## to ``setAppearance:``) and recurse into its subviews. Iterative
+    ## via a manual queue would be cleaner but every settings_app
+    ## subtree we hit is < 200 nodes so plain recursion is fine.
+    if pointer(view) == nil: return
+    let v = view
+    let app = darkAppearance
+    {.emit: """
+    if (((BOOL(*)(id, SEL, id))objc_msgSend)(
+          (id)`v`, sel_registerName("respondsToSelector:"),
+          sel_registerName("setAppearance:"))) {
+      ((void(*)(id, SEL, id))objc_msgSend)(
+        (id)`v`, sel_registerName("setAppearance:"), (id)`app`);
+    }
+    """.}
+    # Also bind the popup's cell (NSPopUpButtonCell) — the cell is what
+    # actually paints the bezel + selected title and consults its own
+    # appearance, which is independent of the control's
+    # ``setAppearance:``.
+    {.emit: """
+    if (((BOOL(*)(id, SEL, id))objc_msgSend)(
+          (id)`v`, sel_registerName("respondsToSelector:"),
+          sel_registerName("cell"))) {
+      id cell = ((id(*)(id, SEL))objc_msgSend)(
+        (id)`v`, sel_registerName("cell"));
+      if (cell && ((BOOL(*)(id, SEL, id))objc_msgSend)(
+            cell, sel_registerName("respondsToSelector:"),
+            sel_registerName("setAppearance:"))) {
+        ((void(*)(id, SEL, id))objc_msgSend)(
+          cell, sel_registerName("setAppearance:"), (id)`app`);
+      }
+    }
+    """.}
+    # Now recurse into subviews. We pull the subview count + each
+    # child handle into Nim-side variables so the recursion stays
+    # purely Nim (no ObjC blocks).
+    var childCount: clong = 0
+    {.emit: """
+    if (((BOOL(*)(id, SEL, id))objc_msgSend)(
+          (id)`v`, sel_registerName("respondsToSelector:"),
+          sel_registerName("subviews"))) {
+      id subs = ((id(*)(id, SEL))objc_msgSend)(
+        (id)`v`, sel_registerName("subviews"));
+      if (subs) {
+        `childCount` = (long)((long(*)(id, SEL))objc_msgSend)(
+          subs, sel_registerName("count"));
+      }
+    }
+    """.}
+    for i in 0 ..< childCount:
+      var child: cocoa_objc.Id
+      let idx = i
+      {.emit: """
+      id subs = ((id(*)(id, SEL))objc_msgSend)(
+        (id)`v`, sel_registerName("subviews"));
+      `child` = ((id(*)(id, SEL, long))objc_msgSend)(
+        subs, sel_registerName("objectAtIndex:"), (long)`idx`);
+      """.}
+      walkApplyDarkAppearance(child, app)
+
+  proc forceDarkAquaAppearance(view: cocoa_objc.Id) =
+    ## M-EVP-14 Wave Y (Y-1 fix): the per-control ``setAppearance:`` call
+    ## inside ``isonim_cocoa/renderer.nim`` (ekSelect branch) lands on
+    ## the NSPopUpButton instance, but the appearance does NOT
+    ## propagate down to the popup's NSPopUpButtonCell / NSMenu (the
+    ## cell paints with its own ``effectiveAppearance`` snapshot taken
+    ## at draw time, which falls back to NSApp.effectiveAppearance when
+    ## no NSWindow is in play). Round-17 reviewer confirmed the popup
+    ## still renders light-on-light despite the Wave X-6 fix. The fix:
+    ## (1) push the dark appearance onto the NSApplication singleton so
+    ## every drawing operation that consults ``+[NSApp
+    ## effectiveAppearance]`` sees dark; AND (2) recursively walk the
+    ## subview tree applying ``setAppearance:`` to every view AND its
+    ## cell (NSPopUpButtonCell is the one that paints the bezel/title).
+    ## Belt and suspenders.
+    var darkAppearance: cocoa_objc.Id
+    {.emit: """
+    id darkName = ((id(*)(id, SEL, const char*))objc_msgSend)(
+      (id)objc_getClass("NSString"),
+      sel_registerName("stringWithUTF8String:"),
+      "NSAppearanceNameDarkAqua");
+    `darkAppearance` = ((id(*)(id, SEL, id))objc_msgSend)(
+      (id)objc_getClass("NSAppearance"),
+      sel_registerName("appearanceNamed:"), darkName);
+    if (`darkAppearance`) {
+      // (1) Pin the global NSApp appearance. NSPopUpButtonCell and
+      // NSMenu both consult NSApp.effectiveAppearance during draw
+      // when no NSWindow is in the inheritance chain.
+      id app = ((id(*)(id, SEL))objc_msgSend)(
+        (id)objc_getClass("NSApplication"),
+        sel_registerName("sharedApplication"));
+      if (app && ((BOOL(*)(id, SEL, id))objc_msgSend)(
+            app, sel_registerName("respondsToSelector:"),
+            sel_registerName("setAppearance:"))) {
+        ((void(*)(id, SEL, id))objc_msgSend)(
+          app, sel_registerName("setAppearance:"), `darkAppearance`);
+      }
+      // Also push the dark appearance onto the global +[NSAppearance
+      // currentAppearance] (legacy fallback path on older macOS).
+      if (((BOOL(*)(id, SEL, id))objc_msgSend)(
+            (id)objc_getClass("NSAppearance"),
+            sel_registerName("respondsToSelector:"),
+            sel_registerName("setCurrentAppearance:"))) {
+        ((void(*)(id, SEL, id))objc_msgSend)(
+          (id)objc_getClass("NSAppearance"),
+          sel_registerName("setCurrentAppearance:"), `darkAppearance`);
+      }
+    }
+    """.}
+    if pointer(darkAppearance) == nil: return
+    walkApplyDarkAppearance(view, darkAppearance)
+
   proc setLayerBackgroundColor(view: cocoa_objc.Id;
                                 r, g, b, a: cdouble) =
     ## Force ``view.wantsLayer = YES`` and stamp the layer's
@@ -482,6 +596,14 @@ when defined(macosx):
     # bottom-up frame y. With ``parentH = h`` the root's NS-y is 0,
     # which is what we want for the capture target.
     layoutTreeForCapture(src.renderer, src.root, h, 0, 0, w, h)
+    # M-EVP-14 Wave Y (Y-1): pin the global + per-view appearance to
+    # NSAppearanceNameDarkAqua so NSPopUpButtonCell / NSMenu / NSSwitch
+    # paint with the dark trait collection. See ``forceDarkAquaAppearance``
+    # for the full rationale; this must run AFTER ``layoutTreeForCapture``
+    # but BEFORE ``captureViewRgba`` so every view in the live tree
+    # exists, has its frame set, and receives the appearance push before
+    # AppKit's ``cacheDisplayInRect:`` draw pass.
+    forceDarkAquaAppearance(cocoa_objc.Id(src.root))
     var pixels = cocoa_capture.captureViewRgba(Id(src.root), w, h)
     if pixels.len != w * h * 4:
       # The capture helper returns an empty seq on AppKit error
