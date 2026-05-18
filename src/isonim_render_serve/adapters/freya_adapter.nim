@@ -47,7 +47,7 @@
 ## `paragraph`, `image`, `ScrollView`, ...) differs from GPUI's
 ## HTML-like tag set, so the colour table below is Freya-specific.
 
-import std/hashes
+import std/[hashes, strutils]
 
 import isonim_freya/renderer
 import isonim_freya/bindings as freya_bindings
@@ -116,11 +116,31 @@ proc colourForTag(tag, label: string): tuple[r, g, b: uint8] =
               uint8((h shr 8) and 0xFF),
               uint8((h shr 16) and 0xFF))
 
+proc parsePxAttr(s: string): int =
+  ## Parse an integer pixel attribute like "120" or "120px". Returns 0
+  ## when the value is empty or unparseable; the layout caller treats
+  ## 0 as "no fixed size, distribute flexibly". Mirror of the helper
+  ## in ``cocoa_adapter.nim``.
+  if s.len == 0: return 0
+  var t = s
+  if t.endsWith("px"): t = t[0 ..< t.len - 2]
+  try: parseInt(t.strip()) except CatchableError: 0
+
 proc walkLayout(node: FreyaElement; x, y, w, h: int;
                 rects: var seq[LayoutRect]; depth = 0; maxDepth = 8) =
   ## DFS that produces one ``LayoutRect`` per visited element. The
   ## traversal order matches the F-packet rasteriser's drawing order
   ## so the manifest's per-node bounds are byte-stable across re-emits.
+  ##
+  ## M-EVP-14 round-7 fix: extended to honor ``data-fixed-width`` and
+  ## ``data-fixed-height`` attributes (mirror of the cocoa adapter's
+  ## fixed-size pre-pass). A child with ``data-fixed-width="120"``
+  ## under a horizontal-layout parent gets exactly 120 px along the
+  ## main axis and the remainder is distributed equally among the
+  ## flex siblings. Without this, the previous "split parent's width
+  ## equally" behaviour stretched the task_app's Add Task button to
+  ## ~40 % of the pane and the filter chips to ~1/3 each, which the
+  ## strict reviewer flagged as "severely stretched controls".
   if node == nil or w <= 0 or h <= 0: return
   if depth > maxDepth: return
   let tag = getTag(node)
@@ -131,22 +151,84 @@ proc walkLayout(node: FreyaElement; x, y, w, h: int;
                        depth: depth, tag: tag, label: label)
   let count = childCount(node)
   if count == 0: return
-  # Reserve a small "header band" at the top so the parent's fill
-  # remains visible (children stack below). 12px or 1/4 of h.
-  let headerBand = min(12, max(0, h div 4))
-  let bodyY = y + headerBand
-  let bodyH = h - headerBand
-  if bodyH <= 0: return
-  let perChild = max(1, bodyH div count)
-  var cy = bodyY
+  let isHorizontal = getAttribute(node, "data-layout") == "horizontal"
+  # Pre-pass: compute per-child fixed and flexible sizes along the
+  # layout axis. Mirrors the cocoa adapter exactly so cross-renderer
+  # parity for the same leaves-table emits matching geometry.
+  var fixedSizes = newSeq[int](count)
+  var fixedTotal = 0
+  var flexCount = 0
   for i in 0 ..< count:
     let child = nthChild(node, i)
-    if child == nil: continue
-    let ch =
-      if i == count - 1: bodyY + bodyH - cy  # last child consumes remainder
-      else: perChild
-    walkLayout(child, x + 4, cy, w - 8, ch, rects, depth + 1, maxDepth)
-    cy += ch
+    if child == nil:
+      fixedSizes[i] = 0
+      continue
+    let attr =
+      if isHorizontal: getAttribute(child, "data-fixed-width")
+      else: getAttribute(child, "data-fixed-height")
+    let s = parsePxAttr(attr)
+    fixedSizes[i] = s
+    if s > 0: fixedTotal += s
+    else: inc flexCount
+  if isHorizontal:
+    # Horizontal flow — left-to-right. Each child fills the parent's
+    # height; widths come from ``data-fixed-width`` or an equal share
+    # of the remainder. The 4 px / 8 px insets from the vertical path
+    # are NOT applied here so a row of pinned buttons sits flush
+    # against the parent's edges.
+    let bodyW = w
+    if bodyW <= 0: return
+    let flexTotal = max(0, bodyW - fixedTotal)
+    let perFlex = if flexCount > 0: max(1, flexTotal div flexCount) else: 0
+    var cx = x
+    let childY = y
+    let childH = h
+    for i in 0 ..< count:
+      let child = nthChild(node, i)
+      if child == nil: continue
+      let remaining = (x + bodyW) - cx
+      if remaining <= 0: break
+      let cw =
+        if fixedSizes[i] > 0:
+          min(fixedSizes[i], remaining)
+        elif i == count - 1:
+          remaining
+        elif perFlex > remaining:
+          remaining
+        else:
+          perFlex
+      if cw <= 0: break
+      walkLayout(child, cx, childY, cw, childH, rects,
+                 depth + 1, maxDepth)
+      cx += cw
+  else:
+    # Vertical flow — the historical default. Reserve a small "header
+    # band" at the top so the parent's fill remains visible (children
+    # stack below). 12px or 1/4 of h.
+    let headerBand = min(12, max(0, h div 4))
+    let bodyY = y + headerBand
+    let bodyH = h - headerBand
+    if bodyH <= 0: return
+    let flexTotal = max(0, bodyH - fixedTotal)
+    let perFlex = if flexCount > 0: max(1, flexTotal div flexCount) else: 0
+    var cy = bodyY
+    for i in 0 ..< count:
+      let child = nthChild(node, i)
+      if child == nil: continue
+      let remaining = (bodyY + bodyH) - cy
+      if remaining <= 0: break
+      let ch =
+        if fixedSizes[i] > 0:
+          min(fixedSizes[i], remaining)
+        elif i == count - 1:
+          remaining
+        elif perFlex > remaining:
+          remaining
+        else:
+          perFlex
+      if ch <= 0: break
+      walkLayout(child, x + 4, cy, w - 8, ch, rects, depth + 1, maxDepth)
+      cy += ch
 
 proc buildLayoutRects*(root: FreyaElement; width, height: int):
                       seq[LayoutRect] =
