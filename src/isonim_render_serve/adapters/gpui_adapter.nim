@@ -80,6 +80,9 @@ type
     x*, y*, w*, h*: int
     depth*: int
     tag*, label*: string
+    ariaPressed*: bool
+    toggleOn*: bool
+    isToggle*: bool
 
   Rect = object
     x, y, w, h: int
@@ -122,8 +125,26 @@ proc walkLayout(node: GpuiElement; x, y, w, h: int;
   let txt = textContent(node)
   let cls = getAttribute(node, "class")
   let label = txt & "|" & cls
+  # Wave U-4: lift the leaf-set "active" hint into the synthetic
+  # rasteriser so the GPUI placeholder paints the same indigo accent
+  # the leaves request via ``background: #7c7aed``. The synthetic
+  # adapter cannot read CSS-style backgrounds (the shim's tree API
+  # has no ``getStyle``), but every leaf that paints the indigo
+  # accent ALSO writes ``aria-pressed="true"`` (settings group rail,
+  # filter chips) or ``data-active="true"`` (segmented controls) or
+  # ``checked="checked"`` (toggle pill), so reading those attributes
+  # is a cheap content-based signal that survives RPC across the
+  # GPUI binding without a new C entry point.
+  let ariaPressed =
+    getAttribute(node, "aria-pressed") == "true" or
+    getAttribute(node, "data-active") == "true"
+  let toggleAttr = getAttribute(node, "data-toggle")
+  let isToggle = toggleAttr == "true"
+  let toggleOn = isToggle and getAttribute(node, "data-value") == "true"
   rects.add LayoutRect(node: node, x: x, y: y, w: w, h: h,
-                       depth: depth, tag: tag, label: label)
+                       depth: depth, tag: tag, label: label,
+                       ariaPressed: ariaPressed,
+                       isToggle: isToggle, toggleOn: toggleOn)
   let count = childCount(node)
   if count == 0: return
   # Reserve a small "header band" at the top so the parent's fill
@@ -274,8 +295,26 @@ proc renderSyntheticFrame(src: GpuiFrameSource): Frame =
   if src.root != nil:
     let layoutRects = buildLayoutRects(src.root, w, h)
     for lr in layoutRects:
-      let (cr, cg, cb) = colourForTag(lr.tag, lr.label)
-      let alpha = 0xFFu8 - uint8(min(lr.depth * 16, 0xC0))
+      var (cr, cg, cb) = colourForTag(lr.tag, lr.label)
+      var alpha = 0xFFu8 - uint8(min(lr.depth * 16, 0xC0))
+      # Wave U-4: paint the brand indigo on nodes the leaves marked
+      # active. Mirrors the leaf-set ``background: #7c7aed`` that the
+      # synthetic adapter cannot otherwise observe (no ``getStyle``
+      # on the shim's tree API). For toggle pills we additionally
+      # paint the ON state in indigo and the OFF state in a darker
+      # neutral so the toggle widget is visibly readable at preview
+      # scale (the 36x20 pill from the round-10 polish was invisible
+      # because the bare ``<div>`` tag colour matched the row
+      # surface).
+      if lr.ariaPressed:
+        cr = 0x7C'u8; cg = 0x7A'u8; cb = 0xED'u8
+        alpha = 0xFF'u8
+      elif lr.isToggle:
+        if lr.toggleOn:
+          cr = 0x7C'u8; cg = 0x7A'u8; cb = 0xED'u8
+        else:
+          cr = 0x2A'u8; cg = 0x2A'u8; cb = 0x3A'u8
+        alpha = 0xFF'u8
       fillRect(pixels, w, h, Rect(x: lr.x, y: lr.y, w: lr.w, h: lr.h,
                                   r: cr, g: cg, b: cb, a: alpha,
                                   label: lr.label))
