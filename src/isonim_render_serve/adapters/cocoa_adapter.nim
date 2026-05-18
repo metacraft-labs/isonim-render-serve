@@ -402,6 +402,21 @@ when defined(macosx):
       let flexTotal = max(0, bodyH - fixedTotal)
       let perFlex = if flexCount > 0: max(1, flexTotal div flexCount) else: 0
       var cy = bodyY
+      # M-EVP-14 Wave W (W-1 fix): in vertical layout the main axis is
+      # height, so ``data-fixed-height`` is the size-along-axis hint
+      # honoured by the pre-pass above. ``data-fixed-width`` is the
+      # cross-axis hint and was previously ignored — every child
+      # stretched to the parent's full body width regardless of its
+      # natural size. That made the settings_app toggle pills
+      # (``<switch>`` with ``data-fixed-width="44"``) render as
+      # full-row indigo bars instead of compact pills hugged to the
+      # right edge. We now read each child's ``data-fixed-width`` and,
+      # when present and smaller than the parent's body width, render
+      # the child at that exact cross-axis size right-aligned to the
+      # body's right edge. Children without ``data-fixed-width`` keep
+      # the previous behaviour (fill body width, 4 px inset).
+      let bodyX = 4
+      let bodyW = w - 8
       for i in 0 ..< count:
         let child = r.nthChild(node, i)
         if isNilNode(child): continue
@@ -417,11 +432,21 @@ when defined(macosx):
           else:
             perFlex
         if ch <= 0: break
+        # Cross-axis: if the child declares ``data-fixed-width`` and
+        # the requested width fits inside the body band, render at
+        # that exact width right-aligned. Otherwise fill the body band.
+        let crossAttr = r.getAttribute(child, "data-fixed-width")
+        let crossFixed = parsePxAttr(crossAttr)
+        var childX = bodyX
+        var childW = bodyW
+        if crossFixed > 0 and crossFixed < bodyW:
+          childW = crossFixed
+          childX = bodyX + (bodyW - childW)  # right-align
         # Children are positioned in the parent's local coordinate
         # space (NSView's frame origin is relative to the immediate
         # superview's bounds). The 4-pixel horizontal inset keeps the
         # parent's tint visible as a card edge.
-        layoutTreeForCapture(r, child, h, 4, cy, w - 8, ch,
+        layoutTreeForCapture(r, child, h, childX, cy, childW, ch,
                              depth + 1, maxDepth, propagateBg)
         cy += ch
 
