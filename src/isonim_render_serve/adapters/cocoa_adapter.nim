@@ -158,6 +158,12 @@ when defined(macosx):
 import ../frame_source
 import ../packet
 import ../element_tree_attrs
+import ./cocoa_metal_capture
+
+export cocoa_metal_capture.CocoaCapturePath,
+       cocoa_metal_capture.isMetalCaptureAvailable,
+       cocoa_metal_capture.selectCocoaCapturePath,
+       cocoa_metal_capture.capturePathName
 
 type
   CocoaCaptureMode* = enum
@@ -172,11 +178,20 @@ type
     ## context for either capture path — `windowId` is only consulted
     ## when `mode == ccmWindowScreencap`, otherwise the root NSView is
     ## used as-is.
+    ##
+    ## EPP-M4: ``capturePath`` selects between the Metal-backed
+    ## CARenderer offscreen render (``ccpMetal``, default on hosts
+    ## where ``MTLCreateSystemDefaultDevice`` succeeds) and the
+    ## legacy AppKit ``cacheDisplayInRect:toBitmapImageRep:`` path
+    ## (``ccpAppKit``, the EPP-M1 baseline). The legacy path remains
+    ## the runtime fallback when the Metal helper returns an empty
+    ## buffer for a given frame (transient GPU loss, sandboxing).
     renderer*: CocoaRenderer
     root*: CocoaElement
     width*, height*: int
     mode*: CocoaCaptureMode
     windowId*: uint32  ## ignored unless mode == ccmWindowScreencap
+    capturePath*: CocoaCapturePath
 
 when defined(macosx):
   ## macOS implementation — real `bitmapImageRepForCachingDisplayInRect`
@@ -383,6 +398,9 @@ when defined(macosx):
     if t.endsWith("px"): t = t[0 ..< t.len - 2]
     try: parseInt(t.strip()) except CatchableError: 0
 
+  proc pxAttr(r: CocoaRenderer; node: CocoaElement; name: string): int =
+    max(0, parsePxAttr(r.getAttribute(node, name)))
+
   proc layoutTreeForCapture(r: CocoaRenderer; node: CocoaElement;
                             parentH: int;
                             x, y, w, h: int; depth = 0;
@@ -450,6 +468,8 @@ when defined(macosx):
     let count = r.childCount(node)
     if count == 0: return
     let isHorizontal = r.getAttribute(node, "data-layout") == "horizontal"
+    let padding = pxAttr(r, node, "data-layout-padding")
+    let gap = pxAttr(r, node, "data-layout-gap")
     # Only reserve a small header band at the outer layers so the
     # parent's card-edge tint stays visible; deeper containers get
     # 0 header band so the settings_app's nested label tree doesn't
@@ -484,17 +504,19 @@ when defined(macosx):
       # subtle parent-edge tint band). The 4 px horizontal inset is
       # subsumed into the parent's start/end gutters by giving each
       # child the parent's full width slice.
-      let bodyW = w
-      if bodyW <= 0: return
-      let flexTotal = max(0, bodyW - fixedTotal)
+      let bodyX = padding
+      let bodyW = w - (padding * 2)
+      let childTotalW = bodyW - (gap * max(0, count - 1))
+      if bodyW <= 0 or childTotalW <= 0: return
+      let flexTotal = max(0, childTotalW - fixedTotal)
       let perFlex = if flexCount > 0: max(1, flexTotal div flexCount) else: 0
-      var cx = 0
-      let childY = 2
-      let childH = max(1, h - 4)
+      var cx = bodyX
+      let defaultChildY = padding
+      let defaultChildH = max(1, h - (padding * 2))
       for i in 0 ..< count:
         let child = r.nthChild(node, i)
         if isNilNode(child): continue
-        let remaining = bodyW - cx
+        let remaining = (bodyX + bodyW) - cx
         if remaining <= 0: break
         let cw =
           if fixedSizes[i] > 0:
@@ -506,14 +528,22 @@ when defined(macosx):
           else:
             perFlex
         if cw <= 0: break
+        var childY = defaultChildY
+        var childH = defaultChildH
+        let crossAttr = r.getAttribute(child, "data-fixed-height")
+        let crossFixed = parsePxAttr(crossAttr)
+        if crossFixed > 0 and crossFixed < defaultChildH:
+          childH = crossFixed
+          childY = defaultChildY + max(0, (defaultChildH - childH) div 2)
         layoutTreeForCapture(r, child, h, cx, childY, cw, childH,
                              depth + 1, maxDepth, propagateBg)
-        cx += cw
+        cx += cw + gap
     else:
-      let bodyY = headerBand
-      let bodyH = h - headerBand
-      if bodyH <= 0: return
-      let flexTotal = max(0, bodyH - fixedTotal)
+      let bodyY = headerBand + padding
+      let bodyH = h - headerBand - (padding * 2)
+      let childTotalH = bodyH - (gap * max(0, count - 1))
+      if bodyH <= 0 or childTotalH <= 0: return
+      let flexTotal = max(0, childTotalH - fixedTotal)
       let perFlex = if flexCount > 0: max(1, flexTotal div flexCount) else: 0
       var cy = bodyY
       # M-EVP-14 Wave W (W-1 fix): in vertical layout the main axis is
@@ -529,8 +559,8 @@ when defined(macosx):
       # the child at that exact cross-axis size right-aligned to the
       # body's right edge. Children without ``data-fixed-width`` keep
       # the previous behaviour (fill body width, 4 px inset).
-      let bodyX = 4
-      let bodyW = w - 8
+      let bodyX = 4 + padding
+      let bodyW = w - 8 - (padding * 2)
       for i in 0 ..< count:
         let child = r.nthChild(node, i)
         if isNilNode(child): continue
@@ -555,14 +585,20 @@ when defined(macosx):
         var childW = bodyW
         if crossFixed > 0 and crossFixed < bodyW:
           childW = crossFixed
-          childX = bodyX + (bodyW - childW)  # right-align
+          let crossAlign = r.getAttribute(child, "data-cross-align")
+          if crossAlign == "start" or crossAlign == "left":
+            childX = bodyX
+          elif crossAlign == "center":
+            childX = bodyX + max(0, (bodyW - childW) div 2)
+          else:
+            childX = bodyX + (bodyW - childW)  # right-align
         # Children are positioned in the parent's local coordinate
         # space (NSView's frame origin is relative to the immediate
         # superview's bounds). The 4-pixel horizontal inset keeps the
         # parent's tint visible as a card edge.
         layoutTreeForCapture(r, child, h, childX, cy, childW, ch,
                              depth + 1, maxDepth, propagateBg)
-        cy += ch
+        cy += ch + gap
 
   proc renderFrame*(src: CocoaFrameSource): Frame =
     ## Capture the rendered Cocoa tree rooted at `src.root` into an
@@ -604,16 +640,38 @@ when defined(macosx):
     # exists, has its frame set, and receives the appearance push before
     # AppKit's ``cacheDisplayInRect:`` draw pass.
     forceDarkAquaAppearance(cocoa_objc.Id(src.root))
-    var pixels = cocoa_capture.captureViewRgba(Id(src.root), w, h)
+    # EPP-M4: capture path selection.
+    #
+    # Per the EPP-M1 audit § 1.3 the AppKit ``cacheDisplayInRect:`` path
+    # is software-rasterised and lands at 10-40 ms / frame on M1; the
+    # Metal-backed CARenderer path is predicted at 5-15 ms. ``src.capturePath``
+    # encodes the launcher's preference (Metal default; AppKit fallback
+    # when ``MTLCreateSystemDefaultDevice`` returns nil at boot). We try
+    # the preferred path first and fall back to AppKit if the Metal
+    # helper returns a zero-length buffer for this frame (rare — usually
+    # a transient GPU loss, sandboxing edge case, or unexpectedly nil
+    # CALayer on a non-layer-backed view).
+    var pixels: seq[byte]
+    var actualPath = src.capturePath
+    if src.capturePath == ccpMetal:
+      pixels = captureViewMetal(Id(src.root), w, h)
+      if pixels.len != w * h * 4:
+        # Transient failure: degrade to AppKit for this frame. We do
+        # NOT mutate ``src.capturePath`` — the next tick re-probes Metal.
+        pixels = cocoa_capture.captureViewRgba(Id(src.root), w, h)
+        actualPath = ccpAppKit
+    else:
+      pixels = cocoa_capture.captureViewRgba(Id(src.root), w, h)
+    discard actualPath  # retained for future "which path actually ran this tick" telemetry
     if pixels.len != w * h * 4:
-      # The capture helper returns an empty seq on AppKit error
-      # (nil view / unsupported pixel format). Treat that as a
-      # hard failure — the bridge expects a wire-valid F packet.
+      # Both paths failed. Treat as a hard error — the bridge expects
+      # a wire-valid F packet.
       raise newException(Defect,
-        "RS-M5 Cocoa capture failed: bitmapImageRepForCachingDisplayInRect " &
-        "returned a buffer of " & $pixels.len & " bytes; expected " &
-        $(w * h * 4) & ". Check that src.root is a live NSView and that " &
-        "AppKit produced an 8-bit bitmap rep.")
+        "EPP-M4 Cocoa capture failed: both Metal and AppKit capture " &
+        "helpers returned " & $pixels.len & " bytes; expected " &
+        $(w * h * 4) & ". Check that src.root is a live NSView, that " &
+        "AppKit produced an 8-bit bitmap rep, and that Metal returned " &
+        "a renderable CARenderer texture.")
     result = Frame(kind: fkFull,
                    flags: FrameFlags(isDiff: false, isVideo: false),
                    width: w, height: h, pixels: pixels)
@@ -664,7 +722,8 @@ else:
 proc newCocoaFrameSource*(renderer: CocoaRenderer; root: CocoaElement;
                           width = 800; height = 600;
                           mode: CocoaCaptureMode = ccmHeadless;
-                          windowId: uint32 = 0): CocoaFrameSource =
+                          windowId: uint32 = 0;
+                          capturePath = ccpMetal): CocoaFrameSource =
   ## Build a `CocoaFrameSource`. The default 800×600 matches the
   ## canonical window size used by the EX-M5 Cocoa task_app demo
   ## (`task_app/main_cocoa.nim`). `mode` defaults to the RS-M0
@@ -672,9 +731,17 @@ proc newCocoaFrameSource*(renderer: CocoaRenderer; root: CocoaElement;
   ## `windowId` to drive the documented `CGWindowListCreateImage`
   ## fallback (macOS host only — Linux scaffold ignores the mode
   ## and returns placeholder pixels either way).
+  ##
+  ## EPP-M4. ``capturePath`` selects the per-frame helper. The
+  ## ``ccpMetal`` default is degraded to ``ccpAppKit`` via
+  ## ``selectCocoaCapturePath`` when the host has no Metal device —
+  ## so callers that pass the default always get a valid path
+  ## without an extra probe at the call site.
+  let resolved = selectCocoaCapturePath(capturePath)
   CocoaFrameSource(renderer: renderer, root: root,
                    width: width, height: height,
-                   mode: mode, windowId: windowId)
+                   mode: mode, windowId: windowId,
+                   capturePath: resolved)
 
 proc toAny*(src: CocoaFrameSource): AnyFrameSource =
   ## Wrap the Cocoa source in the bridge's polymorphic `AnyFrameSource`
@@ -726,6 +793,15 @@ type
 proc isNilElement(e: CocoaElement): bool {.inline.} =
   pointer(e) == nil
 
+proc parseLayoutPxAttr(s: string): int =
+  if s.len == 0: return 0
+  var t = s
+  if t.endsWith("px"): t = t[0 ..< t.len - 2]
+  try: parseInt(t.strip()) except CatchableError: 0
+
+proc layoutPxAttr(r: CocoaRenderer; node: CocoaElement; name: string): int =
+  max(0, parseLayoutPxAttr(r.getAttribute(node, name)))
+
 proc walkLayout(r: CocoaRenderer; node: CocoaElement; x, y, w, h: int;
                 rects: var seq[LayoutRect]; depth = 0; maxDepth = 8) =
   ## DFS that produces one ``LayoutRect`` per visited element. The
@@ -745,22 +821,95 @@ proc walkLayout(r: CocoaRenderer; node: CocoaElement; x, y, w, h: int;
                        depth: depth, tag: cls, label: txt & "|" & cls)
   let count = r.childCount(node)
   if count == 0: return
-  # Reserve a small "header band" at the top so the parent's fill
-  # remains visible (children stack below). 12px or 1/4 of h.
-  let headerBand = min(12, max(0, h div 4))
-  let bodyY = y + headerBand
-  let bodyH = h - headerBand
-  if bodyH <= 0: return
-  let perChild = max(1, bodyH div count)
-  var cy = bodyY
+  let isHorizontal = r.getAttribute(node, "data-layout") == "horizontal"
+  let padding = layoutPxAttr(r, node, "data-layout-padding")
+  let gap = layoutPxAttr(r, node, "data-layout-gap")
+  var fixedSizes = newSeq[int](count)
+  var fixedTotal = 0
+  var flexCount = 0
   for i in 0 ..< count:
     let child = r.nthChild(node, i)
-    if isNilElement(child): continue
-    let ch =
-      if i == count - 1: bodyY + bodyH - cy  # last child consumes remainder
-      else: perChild
-    walkLayout(r, child, x + 4, cy, w - 8, ch, rects, depth + 1, maxDepth)
-    cy += ch
+    if isNilElement(child):
+      fixedSizes[i] = 0
+      continue
+    let attr =
+      if isHorizontal: r.getAttribute(child, "data-fixed-width")
+      else: r.getAttribute(child, "data-fixed-height")
+    let s = parseLayoutPxAttr(attr)
+    fixedSizes[i] = s
+    if s > 0: fixedTotal += s else: inc flexCount
+  if isHorizontal:
+    let bodyX = x + padding
+    let bodySpanW = w - (padding * 2)
+    let childTotalW = bodySpanW - (gap * max(0, count - 1))
+    if bodySpanW <= 0 or childTotalW <= 0: return
+    let flexTotal = max(0, childTotalW - fixedTotal)
+    let perFlex = if flexCount > 0: max(1, flexTotal div flexCount) else: 0
+    var cx = bodyX
+    let childY = y + padding
+    let childH = max(1, h - (padding * 2))
+    for i in 0 ..< count:
+      let child = r.nthChild(node, i)
+      if isNilElement(child): continue
+      let remaining = (bodyX + bodySpanW) - cx
+      if remaining <= 0: break
+      let cw =
+        if fixedSizes[i] > 0:
+          min(fixedSizes[i], remaining)
+        elif i == count - 1:
+          remaining
+        elif perFlex > remaining:
+          remaining
+        else:
+          perFlex
+      if cw <= 0: break
+      walkLayout(r, child, cx, childY, cw, childH, rects,
+                 depth + 1, maxDepth)
+      cx += cw + gap
+  else:
+    # Reserve a small header band at the outer layers so parent
+    # surfaces still show as cards; explicit padding/gap then handles
+    # the visible spacing inside the body.
+    let headerBand = if depth <= 1: min(12, max(0, h div 8)) else: 0
+    let bodyX = x + 4 + padding
+    let bodyW = w - 8 - (padding * 2)
+    let bodyY = y + headerBand + padding
+    let bodySpanH = h - headerBand - (padding * 2)
+    let childTotalH = bodySpanH - (gap * max(0, count - 1))
+    if bodyW <= 0 or bodySpanH <= 0 or childTotalH <= 0: return
+    let flexTotal = max(0, childTotalH - fixedTotal)
+    let perFlex = if flexCount > 0: max(1, flexTotal div flexCount) else: 0
+    var cy = bodyY
+    for i in 0 ..< count:
+      let child = r.nthChild(node, i)
+      if isNilElement(child): continue
+      let remaining = (bodyY + bodySpanH) - cy
+      if remaining <= 0: break
+      let ch =
+        if fixedSizes[i] > 0:
+          min(fixedSizes[i], remaining)
+        elif i == count - 1:
+          remaining
+        elif perFlex > remaining:
+          remaining
+        else:
+          perFlex
+      if ch <= 0: break
+      let crossFixed = layoutPxAttr(r, child, "data-fixed-width")
+      var childX = bodyX
+      var childW = bodyW
+      if crossFixed > 0 and crossFixed < bodyW:
+        childW = crossFixed
+        let crossAlign = r.getAttribute(child, "data-cross-align")
+        if crossAlign == "center":
+          childX = bodyX + max(0, (bodyW - childW) div 2)
+        elif crossAlign == "start" or crossAlign == "left":
+          childX = bodyX
+        else:
+          childX = bodyX + (bodyW - childW)
+      walkLayout(r, child, childX, cy, childW, ch, rects,
+                 depth + 1, maxDepth)
+      cy += ch + gap
 
 proc buildLayoutRects*(r: CocoaRenderer; root: CocoaElement;
                        width, height: int): seq[LayoutRect] =

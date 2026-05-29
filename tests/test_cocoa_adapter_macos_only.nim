@@ -43,6 +43,7 @@ when defined(macosx):
 
   import isonim_render_serve
   import isonim_render_serve/adapters/cocoa_adapter
+  import isonim_render_serve/element_tree_attrs
   import ./ws_test_client
 
   proc makeCocoaConfig(port: int; src: AnyFrameSource;
@@ -150,6 +151,35 @@ when defined(macosx):
       # their own small areas on top, leaving the parent layer
       # visible across most of the canvas.
       check redDominant > (frame.width * frame.height) div 2
+
+    test "manifest layout honors explicit padding and gap attributes":
+      resetTree()
+      resetCallbacks()
+      let r = CocoaRenderer()
+      let root = r.createElement("div")
+      r.setAttribute(root, ComponentPathAttr, "root")
+      r.setAttribute(root, ElementKindAttr, "app-shell")
+      r.setAttribute(root, "data-layout", "horizontal")
+      r.setAttribute(root, "data-layout-padding", "10")
+      r.setAttribute(root, "data-layout-gap", "5")
+      let fixed = r.createElement("button")
+      r.setAttribute(fixed, ComponentPathAttr, "fixed")
+      r.setAttribute(fixed, ElementKindAttr, "button")
+      r.setAttribute(fixed, "data-fixed-width", "40")
+      r.appendChild(root, fixed)
+      let flex = r.createElement("span")
+      r.setAttribute(flex, ComponentPathAttr, "flex")
+      r.setAttribute(flex, ElementKindAttr, "label")
+      r.appendChild(root, flex)
+
+      let manifest = buildCocoaElementTreeManifest(root, 200, 60)
+      check manifest.elements.len == 3
+      check manifest.elements[0].bounds == ElementBounds(x: 0, y: 0,
+        w: 200, h: 60)
+      check manifest.elements[1].bounds == ElementBounds(x: 10, y: 10,
+        w: 40, h: 40)
+      check manifest.elements[2].bounds == ElementBounds(x: 55, y: 10,
+        w: 135, h: 40)
 
     test "streams a real task_app tree end-to-end through the bridge":
       ## EX-M5 canonical composition root — `task_app/main_cocoa`'s

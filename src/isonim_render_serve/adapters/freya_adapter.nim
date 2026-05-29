@@ -126,6 +126,9 @@ proc parsePxAttr(s: string): int =
   if t.endsWith("px"): t = t[0 ..< t.len - 2]
   try: parseInt(t.strip()) except CatchableError: 0
 
+proc pxAttr(node: FreyaElement; name: string): int =
+  max(0, parsePxAttr(getAttribute(node, name)))
+
 proc walkLayout(node: FreyaElement; x, y, w, h: int;
                 rects: var seq[LayoutRect]; depth = 0; maxDepth = 8) =
   ## DFS that produces one ``LayoutRect`` per visited element. The
@@ -152,6 +155,8 @@ proc walkLayout(node: FreyaElement; x, y, w, h: int;
   let count = childCount(node)
   if count == 0: return
   let isHorizontal = getAttribute(node, "data-layout") == "horizontal"
+  let padding = pxAttr(node, "data-layout-padding")
+  let gap = pxAttr(node, "data-layout-gap")
   # Pre-pass: compute per-child fixed and flexible sizes along the
   # layout axis. Mirrors the cocoa adapter exactly so cross-renderer
   # parity for the same leaves-table emits matching geometry.
@@ -176,17 +181,19 @@ proc walkLayout(node: FreyaElement; x, y, w, h: int;
     # of the remainder. The 4 px / 8 px insets from the vertical path
     # are NOT applied here so a row of pinned buttons sits flush
     # against the parent's edges.
-    let bodyW = w
-    if bodyW <= 0: return
-    let flexTotal = max(0, bodyW - fixedTotal)
+    let bodyX = x + padding
+    let bodySpanW = w - (padding * 2)
+    let childTotalW = bodySpanW - (gap * max(0, count - 1))
+    if bodySpanW <= 0 or childTotalW <= 0: return
+    let flexTotal = max(0, childTotalW - fixedTotal)
     let perFlex = if flexCount > 0: max(1, flexTotal div flexCount) else: 0
-    var cx = x
-    let childY = y
-    let childH = h
+    var cx = bodyX
+    let childY = y + padding
+    let childH = max(1, h - (padding * 2))
     for i in 0 ..< count:
       let child = nthChild(node, i)
       if child == nil: continue
-      let remaining = (x + bodyW) - cx
+      let remaining = (bodyX + bodySpanW) - cx
       if remaining <= 0: break
       let cw =
         if fixedSizes[i] > 0:
@@ -200,22 +207,25 @@ proc walkLayout(node: FreyaElement; x, y, w, h: int;
       if cw <= 0: break
       walkLayout(child, cx, childY, cw, childH, rects,
                  depth + 1, maxDepth)
-      cx += cw
+      cx += cw + gap
   else:
     # Vertical flow — the historical default. Reserve a small "header
     # band" at the top so the parent's fill remains visible (children
     # stack below). 12px or 1/4 of h.
     let headerBand = min(12, max(0, h div 4))
-    let bodyY = y + headerBand
-    let bodyH = h - headerBand
-    if bodyH <= 0: return
-    let flexTotal = max(0, bodyH - fixedTotal)
+    let bodyX = x + 4 + padding
+    let bodyW = w - 8 - (padding * 2)
+    let bodyY = y + headerBand + padding
+    let bodySpanH = h - headerBand - (padding * 2)
+    let childTotalH = bodySpanH - (gap * max(0, count - 1))
+    if bodyW <= 0 or bodySpanH <= 0 or childTotalH <= 0: return
+    let flexTotal = max(0, childTotalH - fixedTotal)
     let perFlex = if flexCount > 0: max(1, flexTotal div flexCount) else: 0
     var cy = bodyY
     for i in 0 ..< count:
       let child = nthChild(node, i)
       if child == nil: continue
-      let remaining = (bodyY + bodyH) - cy
+      let remaining = (bodyY + bodySpanH) - cy
       if remaining <= 0: break
       let ch =
         if fixedSizes[i] > 0:
@@ -227,8 +237,8 @@ proc walkLayout(node: FreyaElement; x, y, w, h: int;
         else:
           perFlex
       if ch <= 0: break
-      walkLayout(child, x + 4, cy, w - 8, ch, rects, depth + 1, maxDepth)
-      cy += ch
+      walkLayout(child, bodyX, cy, bodyW, ch, rects, depth + 1, maxDepth)
+      cy += ch + gap
 
 proc buildLayoutRects*(root: FreyaElement; width, height: int):
                       seq[LayoutRect] =

@@ -132,3 +132,53 @@ suite "RS-M11b: buildFreyaElementTreeManifest (direct)":
         for ch in suffix:
           check ch in {'0' .. '9'}
     check rowCount == 3
+
+  test "horizontal layout honors explicit padding and gaps":
+    freya_reset_tree()
+    let r = FreyaRenderer()
+    let row = r.createElement("li")
+    r.setAttribute(row, "data-layout", "horizontal")
+    r.setAttribute(row, "data-layout-padding", "16")
+    r.setAttribute(row, "data-layout-gap", "8")
+
+    let toggle = r.createElement("button")
+    r.setAttribute(toggle, "class", "toggle")
+    r.setTextContent(toggle, "toggle")
+    r.setAttribute(toggle, "data-fixed-width", "20")
+    r.appendChild(row, toggle)
+
+    let label = r.createElement("span")
+    r.setAttribute(label, "class", "label")
+    r.setTextContent(label, "label")
+    r.appendChild(row, label)
+
+    let remove = r.createElement("button")
+    r.setAttribute(remove, "class", "remove")
+    r.setTextContent(remove, "remove")
+    r.setAttribute(remove, "data-fixed-width", "20")
+    r.appendChild(row, remove)
+
+    let rects = buildLayoutRects(row, 800, 52)
+    var toggleRect, labelRect, removeRect: LayoutRect
+    var sawToggle, sawLabel, sawRemove = false
+    for lr in rects:
+      if lr.label == "toggle|toggle":
+        toggleRect = lr
+        sawToggle = true
+      elif lr.label == "label|label":
+        labelRect = lr
+        sawLabel = true
+      elif lr.label == "remove|remove":
+        removeRect = lr
+        sawRemove = true
+
+    check sawToggle
+    check sawLabel
+    check sawRemove
+    check toggleRect.x == 16
+    check toggleRect.w == 20
+    check labelRect.x == 44
+    check removeRect.x == 764
+    check removeRect.w == 20
+    check toggleRect.y == 16
+    check toggleRect.h == 20

@@ -95,6 +95,16 @@ type
       ## launchers under RS-M11b/c). When set, the bridge advertises
       ## `capabilities.elementTree = true` in the `hello` packet and
       ## emits manifest M packets on connect + on change.
+    capturePath*: string
+      ## EPP-M4: optional self-describing capture-path identifier the
+      ## bridge surfaces in the ``hello`` capability bag. The Cocoa
+      ## launcher sets ``"metal"`` when ``MTLCreateSystemDefaultDevice``
+      ## succeeds at boot and ``"appkit"`` for the
+      ## ``cacheDisplayInRect:toBitmapImageRep:`` fallback; other
+      ## launchers leave it empty and the field is omitted from the
+      ## hello JSON. The browser-side e2e test asserts that a Cocoa
+      ## launcher in a Metal-capable env advertises
+      ## ``capabilities.cocoaCapturePath == "metal"``.
 
   Server* = ref object
     cfg*: BridgeConfig
@@ -126,7 +136,8 @@ proc readHeader(headers: HttpHeaders; key: string): string =
 # ---------------------------------------------------------------------------
 
 proc buildHelloJson*(backend: string; width, height: int;
-                     elementTree: bool = false): string =
+                     elementTree: bool = false;
+                     capturePath: string = ""): string =
   ## Build the JSON body for the mandatory first M packet. RS-M0
   ## locks the schema:
   ##   { type: "hello", protocolVersion: 1, backend, capabilities,
@@ -137,6 +148,13 @@ proc buildHelloJson*(backend: string; width, height: int;
   ## launchers that emit element-tree manifests (TUI today; GPUI /
   ## Freya / Cocoa / Android under RS-M11b/c) pass `true` to advertise
   ## the capability.
+  ##
+  ## EPP-M4 adds the optional ``capturePath`` capability — the Cocoa
+  ## launcher advertises ``"metal"`` (CARenderer + MTLTexture readback)
+  ## or ``"appkit"`` (``cacheDisplayInRect:toBitmapImageRep:`` fallback)
+  ## so the browser-side test harness can verify which path produced
+  ## the captured frames. Empty string omits the field for launchers
+  ## that don't differentiate.
   var caps = newJObject()
   caps["diffRegions"] = newJBool(true)    # RS-M3 advertises diff support
   caps["screenshot"] = newJBool(false)    # stub backend has none
@@ -147,6 +165,8 @@ proc buildHelloJson*(backend: string; width, height: int;
   # any JS sender today — see EPP-M1 audit § 4.5).
   caps["inputKinds"] = %* ["key", "mouse", "scroll", "resize", "focus",
                            "keyboard"]
+  if capturePath.len > 0:
+    caps["cocoaCapturePath"] = newJString(capturePath)
   var size = newJObject()
   size["width"] = newJInt(width)
   size["height"] = newJInt(height)
@@ -217,7 +237,8 @@ proc sendHello(client: AsyncSocket; cfg: BridgeConfig;
   let body = buildHelloJson(cfg.backend,
                             cfg.frameSource.width,
                             cfg.frameSource.height,
-                            elementTree = cfg.elementTree != nil)
+                            elementTree = cfg.elementTree != nil,
+                            capturePath = cfg.capturePath)
   let meta = MetaPacket(json: body)
   await sendBinary(client, encodeMeta(meta))
   state.helloSent = true
