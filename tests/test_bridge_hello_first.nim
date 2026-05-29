@@ -42,7 +42,11 @@ suite "isonim-render-serve: hello protocol":
       check caps["diffRegions"].getBool == true
       check caps["screenshot"].getBool == false
       check caps["inputKinds"].kind == JArray
-      check caps["inputKinds"].len == 5
+      # EPP-M7 (commit 1bf09d0) added iekKeyboard alongside the
+      # original 5 input kinds (key / mouse / scroll / resize /
+      # focus). The bridge capability advertisement count grew
+      # from 5 to 6.
+      check caps["inputKinds"].len == 6
       for i in 0 .. 5: poll(20)
 
   test "hello backend identifier is configurable":
