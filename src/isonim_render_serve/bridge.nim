@@ -33,10 +33,12 @@ import std/[asyncdispatch, asynchttpserver, asyncnet, base64,
 import std/sha1 as sha1Mod
 
 import ./packet
+import ./packet_video
 import ./ws_frame
 import ./event_dispatch
 import ./frame_source
 import ./diff_region
+import ./adapters/h264_videotoolbox_encoder
 
 const
   WebSocketGuid* = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -105,6 +107,19 @@ type
       ## hello JSON. The browser-side e2e test asserts that a Cocoa
       ## launcher in a Metal-capable env advertises
       ## ``capabilities.cocoaCapturePath == "metal"``.
+    encoder*: EncoderKind
+      ## EPP-M5: which encoder the per-frame render loop should run.
+      ## ``ekRawRgba`` (default) keeps the EPP-M4-and-prior F-packet
+      ## path; ``ekH264`` activates the VideoToolbox encoder and emits
+      ## V packets per ``packet_video.nim``. Launchers select via
+      ## ``selectEncoderKind(ekH264)`` which automatically degrades to
+      ## ``ekRawRgba`` on hosts without VideoToolbox.
+    encoderHandle*: H264EncoderHandle
+      ## EPP-M5: live encoder instance when ``encoder == ekH264``.
+      ## Set by the launcher; the bridge re-creates it on resize (the
+      ## VTCompressionSession is dimension-bound). Nil when the
+      ## launcher selected ``ekRawRgba`` or the host lacks the
+      ## hardware encoder.
 
   Server* = ref object
     cfg*: BridgeConfig
@@ -137,7 +152,9 @@ proc readHeader(headers: HttpHeaders; key: string): string =
 
 proc buildHelloJson*(backend: string; width, height: int;
                      elementTree: bool = false;
-                     capturePath: string = ""): string =
+                     capturePath: string = "";
+                     encoder: EncoderKind = ekRawRgba;
+                     codecId: string = ""): string =
   ## Build the JSON body for the mandatory first M packet. RS-M0
   ## locks the schema:
   ##   { type: "hello", protocolVersion: 1, backend, capabilities,
@@ -167,6 +184,24 @@ proc buildHelloJson*(backend: string; width, height: int;
                            "keyboard"]
   if capturePath.len > 0:
     caps["cocoaCapturePath"] = newJString(capturePath)
+  # EPP-M5: advertise the encoder kind in the hello capability bag so
+  # the EPP-M6 browser-side decoder can pick the right WebCodecs
+  # ``VideoDecoder`` config (or skip configuring one altogether when
+  # the raw-RGBA path is in force). ``transports`` is the audit-
+  # recommended array form (§ 2.4 #2) — when the launcher carries a
+  # live VideoToolbox encoder both transports are listed; when it
+  # only has raw RGBA only the raw kind is listed.
+  var transports = newJArray()
+  case encoder
+  of ekH264:
+    transports.add newJString("v/" & encoderKindName(ekH264))
+    transports.add newJString("f/" & encoderKindName(ekRawRgba))
+  of ekRawRgba:
+    transports.add newJString("f/" & encoderKindName(ekRawRgba))
+  caps["transports"] = transports
+  caps["encoder"] = newJString(encoderKindName(encoder))
+  if codecId.len > 0:
+    caps["videoCodecId"] = newJString(codecId)
   var size = newJObject()
   size["width"] = newJInt(width)
   size["height"] = newJInt(height)
@@ -213,6 +248,14 @@ type
       ## connection. Empty string means "no manifest sent yet"; the
       ## bridge always emits the first manifest after `hello` and
       ## before the first F packet.
+    h264Encoder: H264EncoderHandle
+      ## EPP-M5: per-connection mutable encoder handle. Seeded from
+      ## ``BridgeConfig.encoderHandle`` on connect; mutated in place
+      ## across resizes (the VTCompressionSession is dimension-bound).
+      ## Per-connection scope matches the audit § 7.4 cadence: a
+      ## single ``BridgeConfig`` shared across multiple concurrent
+      ## browser clients still gets one independent encoder per
+      ## browser, with no race on the session state.
 
 proc manifestKey(m: ElementTreeManifest): string =
   ## Stable hash key over the (id, bounds) tuples of the manifest's
@@ -234,11 +277,17 @@ proc manifestKey(m: ElementTreeManifest): string =
 
 proc sendHello(client: AsyncSocket; cfg: BridgeConfig;
                state: ConnectionState) {.async.} =
+  let codecId =
+    if cfg.encoder == ekH264 and state.h264Encoder != nil:
+      state.h264Encoder.codecId
+    else: ""
   let body = buildHelloJson(cfg.backend,
                             cfg.frameSource.width,
                             cfg.frameSource.height,
                             elementTree = cfg.elementTree != nil,
-                            capturePath = cfg.capturePath)
+                            capturePath = cfg.capturePath,
+                            encoder = cfg.encoder,
+                            codecId = codecId)
   let meta = MetaPacket(json: body)
   await sendBinary(client, encodeMeta(meta))
   state.helloSent = true
@@ -299,6 +348,15 @@ proc frameLoop(client: AsyncSocket; cfg: BridgeConfig;
                state: ConnectionState) {.async.} =
   ## Push the stub source's frames at the configured cadence until
   ## either side hangs up (or `maxFrames` is reached, for the tests).
+  ##
+  ## EPP-M5: when ``cfg.encoder == ekH264`` and a non-nil encoder
+  ## handle is present, each render-frame is passed through the
+  ## VideoToolbox encoder and the result is shipped as a V packet.
+  ## A resize between ticks is detected by comparing the frame source's
+  ## reported dimensions against the encoder's; on mismatch the
+  ## encoder handle is re-created (VTCompressionSession is
+  ## dimension-bound). This matches the audit § 7.4 "Encoder
+  ## lifecycle on resize" recipe.
   var sent = 0
   while not state.closed and not client.isClosed:
     if not state.helloSent:
@@ -311,15 +369,49 @@ proc frameLoop(client: AsyncSocket; cfg: BridgeConfig;
     if cfg.elementTree != nil:
       await sendElementTreeIfChanged(client, cfg, state)
     let curr = cfg.frameSource.renderFrame()
-    let outFrame = buildOutgoingFrame(curr, state)
-    try:
-      await sendBinary(client, encodeFrame(outFrame))
-    except OSError, IOError:
-      return
-    # Cache the *current full frame* for the next tick's diff, not
-    # the encoded outgoing frame (which may be a diff). Caching the
-    # full frame keeps the diff path correct across multiple ticks.
-    state.lastSentFrame = some(curr)
+
+    case cfg.encoder
+    of ekRawRgba:
+      let outFrame = buildOutgoingFrame(curr, state)
+      try:
+        await sendBinary(client, encodeFrame(outFrame))
+      except OSError, IOError:
+        return
+      # Cache the *current full frame* for the next tick's diff, not
+      # the encoded outgoing frame (which may be a diff). Caching the
+      # full frame keeps the diff path correct across multiple ticks.
+      state.lastSentFrame = some(curr)
+    of ekH264:
+      # Resize-driven encoder re-init: VTCompressionSession is
+      # dimension-bound, so a size change requires a fresh session.
+      # The launcher's resizingSink already mutates the frame source's
+      # reported (width, height); we detect that delta here and rebuild
+      # the encoder before pushing the new-size frame through it.
+      if state.h264Encoder != nil and
+         (state.h264Encoder.width != curr.width or
+          state.h264Encoder.height != curr.height):
+        state.h264Encoder = resize(state.h264Encoder,
+                                   curr.width, curr.height)
+      var emitted = false
+      if state.h264Encoder != nil and curr.kind == fkFull:
+        try:
+          let v = encode(state.h264Encoder, curr.pixels)
+          await sendBinary(client, encodeVideoFrame(v))
+          emitted = true
+        except Defect:
+          # Encoder failed (rare — e.g. session lost). Degrade to the
+          # raw F-packet path for this frame so the client doesn't see
+          # a wire stall, and try the encoder again next tick.
+          discard
+      if not emitted:
+        try:
+          await sendBinary(client, encodeFrame(curr))
+        except OSError, IOError:
+          return
+      # No diff cache for the V path — every V packet is self-decodable
+      # (GOP=1 keyframes).
+      state.lastSentFrame = none(Frame)
+
     inc sent
     if cfg.maxFrames > 0 and sent >= cfg.maxFrames:
       return
@@ -401,7 +493,8 @@ proc handleInbound(client: AsyncSocket; cfg: BridgeConfig;
 proc bridgeOnce(client: AsyncSocket; cfg: BridgeConfig) {.async.} =
   let state = ConnectionState(helloSent: false, closed: false,
                               lastSentFrame: none(Frame),
-                              elementTreeKey: "")
+                              elementTreeKey: "",
+                              h264Encoder: cfg.encoderHandle)
   await sendHello(client, cfg, state)
   # RS-M11: the manifest MUST land before the first F packet so the
   # editor's canvas can hit-test the very first pixel-rendered frame.
