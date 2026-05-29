@@ -13,13 +13,28 @@ import ./packet
 type
   InputEventKind* = enum
     iekKey, iekMouse, iekScroll, iekResize, iekFocus,
-    iekSelectStory, iekApplyMutation
+    iekSelectStory, iekApplyMutation, iekKeyboard
 
   Modifiers* = object
     ctrl*, shift*, alt*, meta*: bool
 
   KeyAction* = enum kaDown, kaUp, kaPress
   MouseAction* = enum maDown, maUp, maMove, maClick
+
+  KeyboardAction* = enum
+    ## EPP-M7. Wire schema is locked here: ``down`` / ``up`` /
+    ## ``repeat``. ``repeat`` is the only legitimate third action —
+    ## browsers surface auto-repeat as a ``keydown`` with
+    ## ``event.repeat === true`` and we project that onto a distinct
+    ## action so the launcher's per-key dispatch table can dedupe.
+    ##
+    ## Note this is intentionally distinct from the legacy
+    ## ``KeyAction`` (down / up / press) attached to ``iekKey``: the
+    ## legacy variant was schema-only (no JS sender ever emitted it,
+    ## per the EPP-M1 audit § 4.1 and § 4.5). EPP-M7 promotes
+    ## ``iekKeyboard`` as the canonical, JS-emitted form and locks
+    ## the schema for EPP-M5 / EPP-M6 (encode-bytes-only milestones).
+    kbaDown, kbaUp, kbaRepeat
 
   MutationScope* = enum
     msLocal = "local"
@@ -71,6 +86,38 @@ type
       mutationKey*: string
       mutationValue*: JsonNode
       mutationScope*: MutationScope
+    of iekKeyboard:
+      ## EPP-M7. Keyboard input forwarded from the browser-side
+      ## preview canvas. Mirrors the ``iekMouse`` shape so the
+      ## dispatch loop adds a single switch case rather than a new
+      ## pipeline:
+      ##
+      ##   * ``keyboardAction`` — ``kbaDown`` / ``kbaUp`` /
+      ##     ``kbaRepeat``. Browsers surface auto-repeat as a
+      ##     ``keydown`` with ``event.repeat === true``; the JS shim
+      ##     maps that case to ``kbaRepeat`` so the launcher can
+      ##     dedupe held-key spam.
+      ##   * ``keyboardCode`` — DOM-style virtual-key code
+      ##     (``"KeyA"``, ``"Enter"``, ``"ArrowLeft"``). Stable
+      ##     across keyboard layouts; suitable for shortcut dispatch.
+      ##   * ``keyboardKey`` — DOM-style ``KeyboardEvent.key`` value
+      ##     (``"a"``, ``"A"``, ``"Enter"``). Layout-aware; what most
+      ##     consumer code wants.
+      ##   * ``keyboardText`` — character text the keypress
+      ##     contributes to a focused text input (``"a"``, ``"A"``,
+      ##     ``""`` for non-printable keys like Arrow or Escape).
+      ##     The launcher's text-input handlers (``"input"`` listener
+      ##     on focused ``<input>`` leaves) consume this directly.
+      ##   * ``keyboardModifiers`` — same Modifiers shape attached to
+      ##     mouse events (ctrl / shift / alt / meta).
+      ##
+      ## *Wire schema is locked here. EPP-M5 / EPP-M6 won't change
+      ## the schema — only the encoding bytes.*
+      keyboardAction*: KeyboardAction
+      keyboardKey*: string
+      keyboardCode*: string
+      keyboardText*: string
+      keyboardModifiers*: Modifiers
 
   InputSink* = concept sink
     sink.submit(event: InputEvent)
@@ -112,6 +159,16 @@ proc parseMouseAction(s: string): MouseAction =
   else:
     raise newException(PacketProtocolError,
       "unknown mouse action: " & s)
+
+proc parseKeyboardAction(s: string): KeyboardAction =
+  ## EPP-M7. Wire schema is locked: ``down`` / ``up`` / ``repeat``.
+  case s
+  of "down": kbaDown
+  of "up": kbaUp
+  of "repeat": kbaRepeat
+  else:
+    raise newException(PacketProtocolError,
+      "unknown keyboard action: " & s)
 
 proc decodeInputEvent*(inp: InputPacket): InputEvent =
   ## Parse an I packet's JSON body into the typed variant. Raises
@@ -171,6 +228,25 @@ proc decodeInputEvent*(inp: InputPacket): InputEvent =
     if "focused" notin node or node["focused"].kind != JBool:
       raise newException(PacketProtocolError, "focus: missing focused")
     result = InputEvent(kind: iekFocus, focused: node["focused"].getBool)
+  of "keyboard":
+    ## EPP-M7. ``keyboard`` lays out as
+    ## ``{type, action, key, code, text, modifiers}``. Only ``action``
+    ## is strictly required; the rest default to empty strings / no
+    ## modifiers so the JS shim can send minimal packets for
+    ## non-printable keys.
+    if "action" notin node:
+      raise newException(PacketProtocolError,
+        "keyboard: missing action")
+    result = InputEvent(kind: iekKeyboard,
+      keyboardAction: parseKeyboardAction(node["action"].getStr),
+      keyboardKey: (if "key" in node and node["key"].kind == JString:
+                      node["key"].getStr else: ""),
+      keyboardCode: (if "code" in node and node["code"].kind == JString:
+                       node["code"].getStr else: ""),
+      keyboardText: (if "text" in node and node["text"].kind == JString:
+                       node["text"].getStr else: ""),
+      keyboardModifiers: decodeMods(if "modifiers" in node:
+                                      node["modifiers"] else: nil))
   of "select-story":
     ## RS-M12. ``select-story`` lays out as
     ## ``{type, group, name, kind, storyId, properties?}``. The four
@@ -238,6 +314,15 @@ proc actionToStr(a: MouseAction): string =
   of maMove: "move"
   of maClick: "click"
 
+proc actionToStr*(a: KeyboardAction): string =
+  ## EPP-M7. Inverse of ``parseKeyboardAction``. Public because the
+  ## browser-side ``encodeKeyboardBody`` helper (lives in
+  ## ``streaming_preview.nim``) needs deterministic strings.
+  case a
+  of kbaDown: "down"
+  of kbaUp: "up"
+  of kbaRepeat: "repeat"
+
 proc modsToJson(m: Modifiers): JsonNode =
   result = newJObject()
   result["ctrl"] = newJBool(m.ctrl)
@@ -295,6 +380,13 @@ proc encodeInputEvent*(ev: InputEvent): InputPacket =
     else:
       node["value"] = newJNull()
     node["scope"] = newJString($ev.mutationScope)
+  of iekKeyboard:
+    node["type"] = newJString("keyboard")
+    node["action"] = newJString(actionToStr(ev.keyboardAction))
+    node["key"] = newJString(ev.keyboardKey)
+    node["code"] = newJString(ev.keyboardCode)
+    node["text"] = newJString(ev.keyboardText)
+    node["modifiers"] = modsToJson(ev.keyboardModifiers)
   result = InputPacket(json: $node)
 
 # ---------------------------------------------------------------------------
@@ -352,6 +444,39 @@ proc encodeSelectStoryJson*(storyGroup, storyName, storyKind,
     result.add $properties
   result.add "}"
 
+proc encodeKeyboardJson*(action: KeyboardAction;
+                         key, code, text: string;
+                         modifiers: Modifiers): string =
+  ## EPP-M7. Hand-rolled deterministic encoder for the ``keyboard``
+  ## I-body. Field order locked to
+  ## ``type, action, key, code, text, modifiers`` so the on-wire bytes
+  ## are reproducible across Nim versions / ``std/json`` key
+  ## ordering, matching the byte-stable shape of
+  ## ``encodeSelectStoryJson`` / ``encodeApplyMutationJson`` /
+  ## VRS-M2's ``encodeResizeBody``. Browser-side test harnesses use
+  ## this to assert byte-exact match against what the JS shim emits.
+  result = newStringOfCap(96 + key.len + code.len + text.len)
+  result.add "{\"type\":\"keyboard\""
+  result.add ",\"action\":"
+  result.add jsonEscape(actionToStr(action))
+  result.add ",\"key\":"
+  result.add jsonEscape(key)
+  result.add ",\"code\":"
+  result.add jsonEscape(code)
+  result.add ",\"text\":"
+  result.add jsonEscape(text)
+  result.add ",\"modifiers\":"
+  result.add "{\"ctrl\":"
+  result.add (if modifiers.ctrl: "true" else: "false")
+  result.add ",\"shift\":"
+  result.add (if modifiers.shift: "true" else: "false")
+  result.add ",\"alt\":"
+  result.add (if modifiers.alt: "true" else: "false")
+  result.add ",\"meta\":"
+  result.add (if modifiers.meta: "true" else: "false")
+  result.add "}"
+  result.add "}"
+
 proc encodeApplyMutationJson*(target, key: string; value: JsonNode;
                               scope: MutationScope): string =
   ## Hand-rolled deterministic encoder for the ``apply-mutation``
@@ -402,6 +527,9 @@ proc submit*(sink: BufferedInputSink; event: InputEvent) =
   of iekApplyMutation:
     sink.log.add "apply-mutation " & event.mutationTarget & " " &
                  event.mutationKey & " scope=" & $event.mutationScope
+  of iekKeyboard:
+    sink.log.add "keyboard " & actionToStr(event.keyboardAction) & " " &
+                 event.keyboardCode & " " & event.keyboardKey
 
 # Convenience: render the structured log into a single string for
 # test assertions.

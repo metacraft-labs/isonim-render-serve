@@ -52,12 +52,17 @@ type
     ## log mirroring `BufferedInputSink`'s `log` for assertion-driven
     ## tests. Real demos can subclass and override `submit` if they
     ## need richer routing.
+    ##
+    ## EPP-M7. ``focusedNode`` slot mirrors the GPUI adapter; see
+    ## that module's docs.
     hitTest*: HitTester
     log*: seq[string]
     events*: seq[InputEvent]
+    focusedNode*: FreyaElement
 
 proc newFreyaInputSink*(hitTest: HitTester): FreyaInputSink =
-  FreyaInputSink(hitTest: hitTest, log: @[], events: @[])
+  FreyaInputSink(hitTest: hitTest, log: @[], events: @[],
+                 focusedNode: nil)
 
 proc actionToStr(a: MouseAction): string =
   case a
@@ -72,6 +77,13 @@ proc actionToStr(a: KeyAction): string =
   of kaUp: "up"
   of kaPress: "press"
 
+proc keyboardActionToStr(a: KeyboardAction): string =
+  ## EPP-M7. Mirror of ``event_dispatch.actionToStr(KeyboardAction)``.
+  case a
+  of kbaDown: "down"
+  of kbaUp: "up"
+  of kbaRepeat: "repeat"
+
 proc submit*(sink: FreyaInputSink; event: InputEvent) =
   ## Concept-satisfying entry point. Translates the typed event into
   ## either a `fireEvent` call (for clicks) or a log entry (for
@@ -84,6 +96,8 @@ proc submit*(sink: FreyaInputSink; event: InputEvent) =
     if event.mouseAction == maClick and sink.hitTest != nil:
       let target = sink.hitTest(event.mouseX, event.mouseY)
       if target != nil:
+        # EPP-M7: track click target as implicit keyboard focus.
+        sink.focusedNode = target
         fireEvent(target, "click")
   of iekKey:
     sink.log.add "key " & actionToStr(event.keyAction) & " " & event.key
@@ -91,12 +105,30 @@ proc submit*(sink: FreyaInputSink; event: InputEvent) =
     # tests / dev runs see what the bridge swallowed.
     stderr.writeLine "freya_input_adapter: key event ignored (",
       event.key, ")"
+  of iekKeyboard:
+    # EPP-M7: route through ``fireEvent`` against the implicit
+    # focusedNode. Same shape as ``gpui_input_adapter``.
+    sink.log.add "keyboard " & keyboardActionToStr(event.keyboardAction) &
+      " " & event.keyboardCode & " " & event.keyboardKey
+    if sink.focusedNode != nil:
+      case event.keyboardAction
+      of kbaDown, kbaRepeat:
+        fireEvent(sink.focusedNode, "keydown")
+        if event.keyboardText.len > 0:
+          fireEvent(sink.focusedNode, "input")
+      of kbaUp:
+        fireEvent(sink.focusedNode, "keyup")
   of iekScroll:
     sink.log.add "scroll " & $event.deltaX & "," & $event.deltaY
   of iekResize:
     sink.log.add "resize " & $event.width & "x" & $event.height
   of iekFocus:
     sink.log.add "focus " & (if event.focused: "true" else: "false")
+  of iekSelectStory, iekApplyMutation:
+    # RS-M12 sub-kinds — shouldn't reach the renderer-side adapter
+    # because the launcher wraps it in a ``StoryDispatchSink``. Log
+    # for observability if a future refactor changes the chain.
+    sink.log.add "story/mutation event reached input adapter"
 
 proc joinLog*(sink: FreyaInputSink; sep = "\n"): string =
   sink.log.join(sep)

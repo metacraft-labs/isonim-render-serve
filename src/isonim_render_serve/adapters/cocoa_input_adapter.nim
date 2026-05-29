@@ -74,15 +74,20 @@ type
     ## tests. Carries the `CocoaRenderer` value (needed because the
     ## Cocoa `fireEvent` takes the renderer as its first arg, unlike
     ## GPUI/Freya whose shim free-procs don't).
+    ##
+    ## EPP-M7. ``focusedNode`` slot mirrors the GPUI / Freya adapters;
+    ## see ``gpui_input_adapter`` for the contract.
     renderer*: CocoaRenderer
     hitTest*: HitTester
     log*: seq[string]
     events*: seq[InputEvent]
+    focusedNode*: CocoaElement
 
 proc newCocoaInputSink*(renderer: CocoaRenderer;
                         hitTest: HitTester): CocoaInputSink =
   CocoaInputSink(renderer: renderer, hitTest: hitTest,
-                 log: @[], events: @[])
+                 log: @[], events: @[],
+                 focusedNode: default(CocoaElement))
 
 proc actionToStr(a: MouseAction): string =
   case a
@@ -97,6 +102,13 @@ proc actionToStr(a: KeyAction): string =
   of kaUp: "up"
   of kaPress: "press"
 
+proc keyboardActionToStr(a: KeyboardAction): string =
+  ## EPP-M7. Mirror of ``event_dispatch.actionToStr(KeyboardAction)``.
+  case a
+  of kbaDown: "down"
+  of kbaUp: "up"
+  of kbaRepeat: "repeat"
+
 proc submit*(sink: CocoaInputSink; event: InputEvent) =
   ## Concept-satisfying entry point. Translates the typed event into
   ## either a `fireEvent` call (for clicks, on macOS) or a log entry
@@ -109,6 +121,9 @@ proc submit*(sink: CocoaInputSink; event: InputEvent) =
     if event.mouseAction == maClick and sink.hitTest != nil:
       let target = sink.hitTest(event.mouseX, event.mouseY)
       if pointer(target) != nil:
+        # EPP-M7: track click target as implicit keyboard focus
+        # (same pattern as GPUI / Freya adapters).
+        sink.focusedNode = target
         when defined(macosx):
           sink.renderer.fireEvent(target, "click")
         else:
@@ -125,12 +140,34 @@ proc submit*(sink: CocoaInputSink; event: InputEvent) =
     # swallowed.
     stderr.writeLine "cocoa_input_adapter: key event ignored (",
       event.key, ")"
+  of iekKeyboard:
+    # EPP-M7: route through ``r.fireEvent`` against the implicit
+    # focusedNode. Gated `when defined(macosx)` to match the
+    # mouse-click path's RS-M5 partial-Linux scaffold.
+    sink.log.add "keyboard " & keyboardActionToStr(event.keyboardAction) &
+      " " & event.keyboardCode & " " & event.keyboardKey
+    if pointer(sink.focusedNode) != nil:
+      when defined(macosx):
+        case event.keyboardAction
+        of kbaDown, kbaRepeat:
+          sink.renderer.fireEvent(sink.focusedNode, "keydown")
+          if event.keyboardText.len > 0:
+            sink.renderer.fireEvent(sink.focusedNode, "input")
+        of kbaUp:
+          sink.renderer.fireEvent(sink.focusedNode, "keyup")
+      else:
+        ## Linux scaffold: record the routing decision; the actual
+        ## fireEvent call lands on macOS.
+        sink.log.add "keyboard-target (linux scaffold; fireEvent deferred)"
   of iekScroll:
     sink.log.add "scroll " & $event.deltaX & "," & $event.deltaY
   of iekResize:
     sink.log.add "resize " & $event.width & "x" & $event.height
   of iekFocus:
     sink.log.add "focus " & (if event.focused: "true" else: "false")
+  of iekSelectStory, iekApplyMutation:
+    # RS-M12 sub-kinds — shouldn't reach the renderer-side adapter.
+    sink.log.add "story/mutation event reached input adapter"
 
 proc joinLog*(sink: CocoaInputSink; sep = "\n"): string =
   sink.log.join(sep)

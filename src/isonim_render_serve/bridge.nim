@@ -142,7 +142,11 @@ proc buildHelloJson*(backend: string; width, height: int;
   caps["screenshot"] = newJBool(false)    # stub backend has none
   caps["hotReload"] = newJBool(false)
   caps["elementTree"] = newJBool(elementTree)
-  caps["inputKinds"] = %* ["key", "mouse", "scroll", "resize", "focus"]
+  # EPP-M7 added ``keyboard`` as the canonical browser-emitted form
+  # (the legacy ``key`` kind stays advertised but is not emitted by
+  # any JS sender today — see EPP-M1 audit § 4.5).
+  caps["inputKinds"] = %* ["key", "mouse", "scroll", "resize", "focus",
+                           "keyboard"]
   var size = newJObject()
   size["width"] = newJInt(width)
   size["height"] = newJInt(height)
