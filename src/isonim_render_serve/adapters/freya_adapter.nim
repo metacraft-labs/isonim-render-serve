@@ -249,6 +249,20 @@ proc buildLayoutRects*(root: FreyaElement; width, height: int):
   if root == nil or width <= 0 or height <= 0: return
   walkLayout(root, 0, 0, width, height, result)
 
+proc hitTestPath*(root: FreyaElement; width, height: int;
+                  x, y: int): seq[FreyaElement] =
+  ## EPP-M12. Mirror of the GPUI ``hitTestPath`` — resolves a click
+  ## coordinate to an ordered chain of shadow-tree nodes that contain
+  ## the point ``(x, y)`` (deepest first). See ``gpui_adapter.hitTestPath``
+  ## for the rationale and the walk-up dispatch contract.
+  result = @[]
+  if root == nil or width <= 0 or height <= 0: return
+  let rects = buildLayoutRects(root, width, height)
+  for i in countdown(rects.len - 1, 0):
+    let r = rects[i]
+    if x >= r.x and x < r.x + r.w and y >= r.y and y < r.y + r.h:
+      result.add r.node
+
 # ---------------------------------------------------------------------------
 # Rasterizer: blit the rectangle list into an RGBA8888 row-major buffer.
 # ---------------------------------------------------------------------------

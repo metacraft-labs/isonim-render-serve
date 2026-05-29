@@ -173,6 +173,33 @@ proc buildLayoutRects*(root: GpuiElement; width, height: int):
   if root == nil or width <= 0 or height <= 0: return
   walkLayout(root, 0, 0, width, height, result)
 
+proc hitTestPath*(root: GpuiElement; width, height: int;
+                  x, y: int): seq[GpuiElement] =
+  ## EPP-M12. Resolve a click coordinate into an ordered chain of
+  ## shadow-tree nodes that contain the point ``(x, y)`` — deepest
+  ## leaf first, then each enclosing ancestor up to the root. The
+  ## caller (the per-launcher ``GpuiInputSink``) fires ``"click"`` on
+  ## every node in the chain so that whichever ancestor has the
+  ## registered Nim closure handles the click. ``fireEvent`` is a
+  ## no-op when the node has no listener for the dispatched event,
+  ## so the walk-up is safe to apply unconditionally.
+  ##
+  ## The hit-test reuses ``buildLayoutRects`` — the same rectangle
+  ## list the synthetic rasteriser paints from — so the rect that
+  ## "owns" a pixel in the rendered frame is the rect that receives
+  ## the click. This keeps the click target visibly tied to the
+  ## pixel the user clicked on, independent of changes to the
+  ## per-depth colour heuristic.
+  result = @[]
+  if root == nil or width <= 0 or height <= 0: return
+  let rects = buildLayoutRects(root, width, height)
+  # buildLayoutRects emits rectangles in DFS pre-order; iterating
+  # back-to-front yields deepest-first hits.
+  for i in countdown(rects.len - 1, 0):
+    let r = rects[i]
+    if x >= r.x and x < r.x + r.w and y >= r.y and y < r.y + r.h:
+      result.add r.node
+
 
 # ---------------------------------------------------------------------------
 # Rasterizer: blit the rectangle list into an RGBA8888 row-major buffer.

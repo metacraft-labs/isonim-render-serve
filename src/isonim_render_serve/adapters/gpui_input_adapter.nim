@@ -37,6 +37,18 @@ type
     ## tests) supplies this callback so the adapter stays
     ## demo-agnostic.
 
+  HitChainTester* = proc(x, y: int): seq[GpuiElement]
+                     {.closure, gcsafe.}
+    ## EPP-M12. Resolves a click coordinate into an ordered chain of
+    ## candidate fireable nodes (deepest first, then enclosing
+    ## ancestors). The launcher composition root supplies this so the
+    ## adapter can fire ``"click"`` on every node in the chain — that
+    ## way whichever ancestor has the registered Nim closure handles
+    ## the click. ``fireEvent`` is a no-op on nodes with no listener
+    ## for the dispatched event, so the walk is safe to apply
+    ## unconditionally. See ``gpui_adapter.hitTestPath`` for the
+    ## canonical layout-based implementation.
+
   GpuiInputSink* = ref object
     ## `InputSink` impl. Holds a hit-test callback plus a structured
     ## log mirroring `BufferedInputSink`'s `log` for assertion-driven
@@ -50,13 +62,23 @@ type
     ## browser-side shim sends keystrokes only while the canvas has
     ## focus, so the launcher does not need a separate focus
     ## handshake — every click into the canvas updates this slot.
+    ##
+    ## EPP-M12 adds ``hitChain``: when non-nil, the input adapter
+    ## fires ``"click"`` on every node in the returned chain (deepest
+    ## first) rather than the single legacy ``hitTest`` target. The
+    ## launcher composition root wires this to ``hitTestPath`` so the
+    ## click reaches a fireable shadow-tree leaf even when the
+    ## composition root itself has no click handler.
     hitTest*: HitTester
+    hitChain*: HitChainTester
     log*: seq[string]
     events*: seq[InputEvent]
     focusedNode*: GpuiElement
 
-proc newGpuiInputSink*(hitTest: HitTester): GpuiInputSink =
-  GpuiInputSink(hitTest: hitTest, log: @[], events: @[],
+proc newGpuiInputSink*(hitTest: HitTester;
+                       hitChain: HitChainTester = nil): GpuiInputSink =
+  GpuiInputSink(hitTest: hitTest, hitChain: hitChain,
+                log: @[], events: @[],
                 focusedNode: nil)
 
 proc actionToStr(a: MouseAction): string =
@@ -89,14 +111,31 @@ proc submit*(sink: GpuiInputSink; event: InputEvent) =
   of iekMouse:
     sink.log.add "mouse " & actionToStr(event.mouseAction) & " " &
       $event.mouseX & "," & $event.mouseY
-    if event.mouseAction == maClick and sink.hitTest != nil:
-      let target = sink.hitTest(event.mouseX, event.mouseY)
-      if target != nil:
-        # EPP-M7: remember the click target as the implicit
-        # keyboard-focus sink so subsequent ``iekKeyboard`` events
-        # land on the same leaf.
-        sink.focusedNode = target
-        fireEvent(target, "click")
+    if event.mouseAction == maClick:
+      # EPP-M12: prefer the chain hit-tester when present so the
+      # adapter fires ``"click"`` on every shadow-tree node that
+      # contains the click coordinate (deepest first, then enclosing
+      # ancestors). ``fireEvent`` is a no-op on nodes without a
+      # registered ``"click"`` listener, so the walk-up safely
+      # delivers the click to whichever ancestor actually owns the
+      # handler.
+      if sink.hitChain != nil:
+        let chain = sink.hitChain(event.mouseX, event.mouseY)
+        if chain.len > 0:
+          # EPP-M7: implicit keyboard focus tracks the deepest hit.
+          sink.focusedNode = chain[0]
+          sink.log.add "hit-chain " & $chain.len
+          for node in chain:
+            if node != nil:
+              fireEvent(node, "click")
+      elif sink.hitTest != nil:
+        let target = sink.hitTest(event.mouseX, event.mouseY)
+        if target != nil:
+          # EPP-M7: remember the click target as the implicit
+          # keyboard-focus sink so subsequent ``iekKeyboard`` events
+          # land on the same leaf.
+          sink.focusedNode = target
+          fireEvent(target, "click")
   of iekKey:
     sink.log.add "key " & actionToStr(event.keyAction) & " " & event.key
     # GPUI shim has no keyboard primitive yet; surface to stderr so

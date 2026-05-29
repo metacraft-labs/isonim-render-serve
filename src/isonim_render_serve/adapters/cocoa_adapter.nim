@@ -920,6 +920,21 @@ proc buildLayoutRects*(r: CocoaRenderer; root: CocoaElement;
   if isNilElement(root) or width <= 0 or height <= 0: return
   walkLayout(r, root, 0, 0, width, height, result)
 
+proc hitTestPath*(r: CocoaRenderer; root: CocoaElement;
+                  width, height: int;
+                  x, y: int): seq[CocoaElement] =
+  ## EPP-M12. Mirror of the GPUI ``hitTestPath`` — resolves a click
+  ## coordinate to an ordered chain of shadow-tree nodes that contain
+  ## the point ``(x, y)`` (deepest first). See ``gpui_adapter.hitTestPath``
+  ## for the rationale and the walk-up dispatch contract.
+  result = @[]
+  if isNilElement(root) or width <= 0 or height <= 0: return
+  let rects = buildLayoutRects(r, root, width, height)
+  for i in countdown(rects.len - 1, 0):
+    let lr = rects[i]
+    if x >= lr.x and x < lr.x + lr.w and y >= lr.y and y < lr.y + lr.h:
+      result.add lr.node
+
 proc buildCocoaElementTreeManifest*(root: CocoaElement;
                                     width, height: int;
                                     frameSeq: int = 0):

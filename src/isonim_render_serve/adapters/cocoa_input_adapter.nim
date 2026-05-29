@@ -68,6 +68,13 @@ type
     ## tests) supplies this callback so the adapter stays
     ## demo-agnostic.
 
+  HitChainTester* = proc(x, y: int): seq[CocoaElement]
+                     {.closure, gcsafe.}
+    ## EPP-M12. Resolves a click coordinate into an ordered chain of
+    ## candidate fireable nodes (deepest first, then enclosing
+    ## ancestors). See ``gpui_input_adapter.HitChainTester`` for the
+    ## contract.
+
   CocoaInputSink* = ref object
     ## `InputSink` impl. Holds a hit-test callback plus a structured
     ## log mirroring `BufferedInputSink`'s `log` for assertion-driven
@@ -77,15 +84,21 @@ type
     ##
     ## EPP-M7. ``focusedNode`` slot mirrors the GPUI / Freya adapters;
     ## see ``gpui_input_adapter`` for the contract.
+    ##
+    ## EPP-M12. ``hitChain`` mirrors the GPUI / Freya adapters; see
+    ## ``gpui_input_adapter`` for the walk-up dispatch rationale.
     renderer*: CocoaRenderer
     hitTest*: HitTester
+    hitChain*: HitChainTester
     log*: seq[string]
     events*: seq[InputEvent]
     focusedNode*: CocoaElement
 
 proc newCocoaInputSink*(renderer: CocoaRenderer;
-                        hitTest: HitTester): CocoaInputSink =
+                        hitTest: HitTester;
+                        hitChain: HitChainTester = nil): CocoaInputSink =
   CocoaInputSink(renderer: renderer, hitTest: hitTest,
+                 hitChain: hitChain,
                  log: @[], events: @[],
                  focusedNode: default(CocoaElement))
 
@@ -118,21 +131,37 @@ proc submit*(sink: CocoaInputSink; event: InputEvent) =
   of iekMouse:
     sink.log.add "mouse " & actionToStr(event.mouseAction) & " " &
       $event.mouseX & "," & $event.mouseY
-    if event.mouseAction == maClick and sink.hitTest != nil:
-      let target = sink.hitTest(event.mouseX, event.mouseY)
-      if pointer(target) != nil:
-        # EPP-M7: track click target as implicit keyboard focus
-        # (same pattern as GPUI / Freya adapters).
-        sink.focusedNode = target
-        when defined(macosx):
-          sink.renderer.fireEvent(target, "click")
-        else:
-          ## RS-M5 partial-linux: AppKit dispatch isn't available on
-          ## the Linux host. Record the hit-test resolution so unit
-          ## tests can still assert the routing decision; the actual
-          ## `fireEvent` call lands when the macOS engineer takes
-          ## the milestone.
-          sink.log.add "hit (linux scaffold; fireEvent deferred)"
+    if event.mouseAction == maClick:
+      # EPP-M12: prefer the chain hit-tester so the click reaches a
+      # fireable shadow-tree leaf even when the composition root
+      # itself has no click handler. See the GPUI input adapter for
+      # the rationale; the walk-up dispatch contract is identical.
+      if sink.hitChain != nil:
+        let chain = sink.hitChain(event.mouseX, event.mouseY)
+        if chain.len > 0:
+          sink.focusedNode = chain[0]
+          sink.log.add "hit-chain " & $chain.len
+          when defined(macosx):
+            for node in chain:
+              if pointer(node) != nil:
+                sink.renderer.fireEvent(node, "click")
+          else:
+            sink.log.add "hit-chain (linux scaffold; fireEvent deferred)"
+      elif sink.hitTest != nil:
+        let target = sink.hitTest(event.mouseX, event.mouseY)
+        if pointer(target) != nil:
+          # EPP-M7: track click target as implicit keyboard focus
+          # (same pattern as GPUI / Freya adapters).
+          sink.focusedNode = target
+          when defined(macosx):
+            sink.renderer.fireEvent(target, "click")
+          else:
+            ## RS-M5 partial-linux: AppKit dispatch isn't available on
+            ## the Linux host. Record the hit-test resolution so unit
+            ## tests can still assert the routing decision; the actual
+            ## `fireEvent` call lands when the macOS engineer takes
+            ## the milestone.
+            sink.log.add "hit (linux scaffold; fireEvent deferred)"
   of iekKey:
     sink.log.add "key " & actionToStr(event.keyAction) & " " & event.key
     # Cocoa renderer has no synthetic keyboard primitive in `fireEvent`
