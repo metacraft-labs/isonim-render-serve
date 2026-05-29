@@ -119,6 +119,12 @@ suite "EPP-M5: V codec":
     check peekIsVideoPacket(enc)
     check not peekIsVideoPacket(@[byte 'F', 0x00])
 
-  test "DefaultH264CodecId matches Baseline 3.0":
-    check DefaultH264CodecId == "avc1.42E01E"
+  test "DefaultH264CodecId matches Baseline 4.0 (EPP-M9)":
+    ## EPP-M9 lifted the default from Baseline 3.0 (``avc1.42E01E``,
+    ## which capped coded dims at 720×576 and broke the editor's
+    ## Laptop / Desktop viewports) to Baseline 4.0 (``avc1.420028``,
+    ## MaxFS=8192 macroblocks; covers 2048×1024 and 1920×1080). The
+    ## constraint byte is ``0x00`` to match the actual SPS bytes
+    ## VideoToolbox emits — see packet_video.nim const doc.
+    check DefaultH264CodecId == "avc1.420028"
     check DefaultH264CodecId.len == 11

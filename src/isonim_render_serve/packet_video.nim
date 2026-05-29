@@ -23,10 +23,18 @@
 ##
 ## ``codec_id`` is the same identifier the browser hands to
 ## ``VideoDecoder.configure({ codec })`` — RFC 6381 codec strings:
-## ``avc1.<ProfileIdc><Constraints><LevelIdc>`` in hex. EPP-M5 emits
-## ``avc1.42E01E`` (Baseline profile, no constraints, level 3.0) by
-## default; future milestones may emit ``avc1.42E01F`` (level 3.1),
-## ``avc1.4D401E`` (Main 3.0), or ``hvc1.<...>`` (HEVC).
+## ``avc1.<ProfileIdc><Constraints><LevelIdc>`` in hex. EPP-M5 hard-
+## coded ``avc1.42E01E`` (Baseline profile, no constraints, level 3.0)
+## which the EPP-M9 audit identified as the source of the Cocoa
+## V-decoder configure failure on Laptop / Desktop viewports: Level
+## 3.0 caps coded dims at 720×576. EPP-M9 makes the codec_id a
+## function of the encoder's actually-chosen profile/level via
+## ``profileLevelToCodecId`` below. Today the encoder picks
+## Baseline 4.0 (avc1.42E028) by default — which covers every viewport
+## the editor exposes through 1920×1080. The helper exists so a
+## launcher targeting larger surfaces (mobile portrait 786×1704, 4K
+## desktop, etc.) can pick a higher level without round-tripping the
+## raw VideoToolbox CFStringRef through the Nim/C boundary.
 ##
 ## ``codec_id_len`` is a u8 because RFC 6381 codec strings comfortably
 ## fit in 16 characters (avc1.42E01E is 11). Capping at 255 gives the
@@ -181,8 +189,76 @@ proc peekIsVideoPacket*(bytes: openArray[byte]): bool {.inline.} =
 # ---------------------------------------------------------------------------
 
 const
-  DefaultH264CodecId* = "avc1.42E01E"
-    ## H.264 Baseline profile, no constraints, level 3.0.
-    ## See EPP-M5 brief § "ProfileLevel"; matches
-    ## kVTProfileLevel_H264_Baseline_AutoLevel for our target
-    ## 320x240..1024x768 size envelope.
+  H264ProfileBaseline* = 0x42
+    ## H.264 Baseline ProfileIDC. Used by ``profileLevelToCodecId``.
+  H264ProfileMain* = 0x4D
+    ## H.264 Main ProfileIDC.
+  H264ProfileHigh* = 0x64
+    ## H.264 High ProfileIDC.
+
+  H264ConstraintSetByte* = 0x00
+    ## ConstraintSet bits embedded between ProfileIDC and LevelIDC in
+    ## the RFC 6381 codec string. We emit ``0x00`` because the AVC
+    ## encoder Apple's VideoToolbox produces emits SPS NALUs with the
+    ## constraint_set_flags byte set to ``0x00`` for the Baseline 4.0
+    ## floor the EPP-M9 picker pins. The browser's WebCodecs
+    ## ``VideoDecoder.configure`` call validates the codec_id against
+    ## the SPS at decode time — when the codec_id's constraints byte
+    ## does NOT match the SPS's constraint_set_flags Chrome 137+
+    ## raises "Unsupported configuration. Check isConfigSupported()
+    ## prior to calling configure()" and refuses the configure call.
+    ## Holding the codec_id's byte at ``0x00`` mirrors the SPS and
+    ## keeps the configure call green.
+    ##
+    ## EPP-M9 audit note: a previous draft pinned this at ``0xE0``
+    ## (constraint_set0/1/2 = 1) as a "best-effort match for what the
+    ## encoder probably emits"; the dump of an actual VideoToolbox
+    ## Baseline 4.0 SPS at 800×600 showed the encoder produces
+    ## ``constraint_set_flags = 0x00`` instead. Always trust the bytes
+    ## on the wire — see ``tests/test_packet_video_codec_id_helper.nim``
+    ## for the locked-down expected codec_id strings.
+
+  DefaultH264CodecId* = "avc1.420028"
+    ## H.264 Baseline profile, constraint_set0..2 = 1, level 4.0.
+    ## EPP-M9: lifted from Baseline level 3.0 (``avc1.42E01E``) to
+    ## level 4.0 so the encoder's Laptop / Desktop viewports
+    ## (1280×800, 1440×900, 1920×1080) no longer trip the WebCodecs
+    ## decoder's "coded dimensions exceed advertised profile cap"
+    ## rejection. The encoder is the source of truth — see
+    ## ``profileLevelToCodecId`` below for the helper the launcher
+    ## uses to derive this string from the real bytes the encoder is
+    ## producing on a given session.
+
+proc profileLevelToCodecId*(profileIdc, levelIdc: int): string =
+  ## Build an RFC 6381 ``avc1.<ProfileIDC><Constraints><LevelIDC>``
+  ## codec string from the encoder's reported H.264 profile + level.
+  ##
+  ## ``profileIdc`` is the AVC ProfileIDC byte (e.g. 0x42 Baseline,
+  ## 0x4D Main, 0x64 High); ``levelIdc`` is the AVC level encoded as
+  ## ``level * 10`` (e.g. 3.0 = 0x1E, 3.1 = 0x1F, 4.0 = 0x28).
+  ##
+  ## The constraints byte is fixed at ``H264ConstraintSetByte`` (0xE0)
+  ## because every VideoToolbox-emitted stream in this campaign has the
+  ## first three constraint_set bits set; see the const's doc comment
+  ## for why this is safe to hold constant.
+  ##
+  ## Raises ``PacketProtocolError`` for out-of-range bytes (the AVC
+  ## byte fields are u8 by spec; we surface the violation early instead
+  ## of producing a malformed codec string that the browser would
+  ## silently reject).
+  if profileIdc < 0 or profileIdc > 0xFF:
+    raise newException(PacketProtocolError,
+      "profileIdc " & $profileIdc & " out of u8 range")
+  if levelIdc < 0 or levelIdc > 0xFF:
+    raise newException(PacketProtocolError,
+      "levelIdc " & $levelIdc & " out of u8 range")
+  proc hex2(n: int): string =
+    let hi = (n shr 4) and 0x0F
+    let lo = n and 0x0F
+    proc nibble(x: int): char =
+      if x < 10: char(ord('0') + x) else: char(ord('A') + x - 10)
+    result = ""
+    result.add nibble(hi)
+    result.add nibble(lo)
+  result = "avc1." & hex2(profileIdc) & hex2(H264ConstraintSetByte) &
+           hex2(levelIdc)

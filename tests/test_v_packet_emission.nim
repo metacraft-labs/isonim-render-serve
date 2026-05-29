@@ -116,14 +116,25 @@ suite "EPP-M5: bridge V vs F selection":
       check transports.len == 2
       check transports[0].getStr == "v/h264_videotoolbox"
       check transports[1].getStr == "f/raw_rgba"
-      check caps["videoCodecId"].getStr == "avc1.42E01E"
+      # EPP-M9: codec_id is now derived from the encoder's actually-
+      # chosen H.264 profile/level (per ``profileLevelToCodecId``).
+      # The picker enforces a Baseline 4.0 floor so the codec_id stays
+      # stable at ``avc1.420028`` across the editor's pinned viewport
+      # ladder (Desktop / Laptop / Tablet / Phone). Constraint byte
+      # ``0x00`` mirrors what VideoToolbox actually emits in the SPS
+      # ``constraint_set_flags`` — a previous draft used ``0xE0`` and
+      # tripped Chrome's WebCodecs configure rejection. The floor
+      # applies for the stub source's 320x240 dims here too.
+      check caps["videoCodecId"].getStr == "avc1.420028"
       # First V packet must carry SPS/PPS (every frame is keyframe at
       # GOP=1) and valid Annex-B framing.
       check res.firstV.flags.isKeyframe
       check res.firstV.flags.hasExtraData
       check res.firstV.width == 320
       check res.firstV.height == 240
-      check res.firstV.codecId == "avc1.42E01E"
+      check res.firstV.codecId == "avc1.420028"  # EPP-M9 Baseline 4.0
+                                                  # floor — see hello-bag
+                                                  # assertion above for why.
       check res.firstV.naluBytes.len > 0
       # Annex-B start code: NALU stream must begin with 0x00000001.
       check res.firstV.naluBytes[0] == 0x00'u8

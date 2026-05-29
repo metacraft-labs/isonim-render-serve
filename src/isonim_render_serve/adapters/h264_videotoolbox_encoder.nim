@@ -85,7 +85,7 @@ proc encoderKindName*(k: EncoderKind): string =
 
 proc newH264EncoderHandle*(width, height: int;
                            bitrate = 2_000_000;
-                           codecId = DefaultH264CodecId): H264EncoderHandle =
+                           codecId = ""): H264EncoderHandle =
   ## Build a live encoder. Returns nil if the host has no
   ## hardware encoder; the caller MUST treat nil as "fall back to
   ## ``ekRawRgba``" and not attempt to encode.
@@ -93,12 +93,28 @@ proc newH264EncoderHandle*(width, height: int;
   ## ``bitrate`` is the per-second average target in bits. The
   ## EPP-M5 brief targets ~2 Mbps at 1024x768; for smaller surfaces
   ## the encoder honours the cap but typically lands below it.
+  ##
+  ## EPP-M9 ``codecId`` policy: if the caller passes the empty string
+  ## (the new default), the codec_id is derived from the encoder's
+  ## actually-chosen H.264 profile / level via
+  ## ``profileLevelToCodecId``. This guarantees the wire-advertised
+  ## codec string can never drift from the bytes the encoder produces
+  ## — which was the EPP-M5 → EPP-M9 regression that broke Cocoa's
+  ## V-decoder on Laptop / Desktop viewports. Callers MAY still pin
+  ## an explicit codec_id string (e.g. for tests that need a known
+  ## value); whatever they pass is shipped verbatim.
   when defined(macosx):
     if not vt.isVideoToolboxAvailable(): return nil
     let raw = vt.newVideoToolboxEncoder(width, height, bitrate)
     if raw == nil: return nil
+    let resolvedCodecId =
+      if codecId.len > 0: codecId
+      elif raw.profileIdc != 0 and raw.levelIdc != 0:
+        profileLevelToCodecId(raw.profileIdc, raw.levelIdc)
+      else:
+        DefaultH264CodecId
     H264EncoderHandle(width: width, height: height,
-                      bitrate: bitrate, codecId: codecId,
+                      bitrate: bitrate, codecId: resolvedCodecId,
                       handle: raw)
   else:
     discard width; discard height; discard bitrate; discard codecId
@@ -119,12 +135,21 @@ proc resize*(enc: H264EncoderHandle; newW, newH: int): H264EncoderHandle =
   ## responsible for swapping the field in its source struct.
   ## Pattern lifted from the EPP-M5 brief § "Encoder lifecycle hooks
   ## for resize".
+  ##
+  ## EPP-M9 codec_id policy: a resize re-derives the codec_id from the
+  ## new encoder's profile/level selection. The previous EPP-M5
+  ## behaviour propagated the old codec_id verbatim, which broke the
+  ## browser's WebCodecs decoder when the new dims fell outside the
+  ## old level's coded-dim cap (the audit § 2.1 root cause of EPP-M9).
+  ## With the dynamic selector active a resize picks whatever level
+  ## the new dims need; the codec_id derived from that level reflects
+  ## the wire bytes the encoder actually produces, so the browser
+  ## reconfigures its decoder correctly across the resize boundary.
   if enc == nil:
     return newH264EncoderHandle(newW, newH)
   let bitrate = enc.bitrate
-  let codecId = enc.codecId
   destroy(enc)
-  newH264EncoderHandle(newW, newH, bitrate, codecId)
+  newH264EncoderHandle(newW, newH, bitrate, codecId = "")
 
 proc encode*(enc: H264EncoderHandle;
              rgba: openArray[byte]): VideoFrame =
