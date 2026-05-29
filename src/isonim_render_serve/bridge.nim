@@ -29,7 +29,8 @@
 ## directly (the constructor builds the wrapper for the caller).
 
 import std/[asyncdispatch, asynchttpserver, asyncnet, base64,
-            httpcore, json, nativesockets, options, os, strutils]
+            httpcore, json, monotimes, nativesockets, options, os,
+            strutils, times]
 import std/sha1 as sha1Mod
 
 import ./packet
@@ -357,11 +358,24 @@ proc frameLoop(client: AsyncSocket; cfg: BridgeConfig;
   ## encoder handle is re-created (VTCompressionSession is
   ## dimension-bound). This matches the audit § 7.4 "Encoder
   ## lifecycle on resize" recipe.
+  ##
+  ## EPP-M10 cadence fix: the post-frame sleep below subtracts the
+  ## elapsed render+send time from ``frameIntervalMs`` so the wall-
+  ## clock period is the requested period (~33 ms at 30 fps),
+  ## not ``render + 33 ms``. The pre-EPP-M10 loop stacked the sleep
+  ## on top of the render time, which surfaced as the EPP-M8 matrix's
+  ## "Freya 62 ms median at Desktop" gap even after the Skia render
+  ## itself dropped to 28 ms (the sleep was paying the full 33 ms cap
+  ## regardless). Backwards-compatible: if a frame takes longer than
+  ## the requested interval, the sleep clamps to a small minimum
+  ## (1 ms) instead of going negative, which preserves yielding to
+  ## the event loop for I/O dispatch.
   var sent = 0
   while not state.closed and not client.isClosed:
     if not state.helloSent:
       await sleepAsync(5)
       continue
+    let tickStart = getMonoTime()
     # RS-M11: re-check the element-tree manifest each tick BEFORE
     # rendering the frame. If the (id, bounds) set has changed we
     # emit a fresh manifest; otherwise the cadence rule skips the
@@ -415,7 +429,12 @@ proc frameLoop(client: AsyncSocket; cfg: BridgeConfig;
     inc sent
     if cfg.maxFrames > 0 and sent >= cfg.maxFrames:
       return
-    await sleepAsync(cfg.frameIntervalMs)
+    # EPP-M10 cadence: budget = requested frame interval. Sleep only
+    # the residue so the wall-clock period matches the user's --fps
+    # request even when the render itself takes most of the cap.
+    let elapsedMs = int(inMilliseconds(getMonoTime() - tickStart))
+    let residueMs = cfg.frameIntervalMs - elapsedMs
+    await sleepAsync(max(1, residueMs))
 
 proc handleInbound(client: AsyncSocket; cfg: BridgeConfig;
                    state: ConnectionState) {.async.} =

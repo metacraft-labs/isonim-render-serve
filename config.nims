@@ -10,6 +10,14 @@
 ## the cross-repo paths below.
 
 switch("path", "$config")
+# EPP-M10: the budget test (and any future bare ``nim c -r`` invocation
+# from the repo root) needs ``src`` on the import path so
+# ``isonim_render_serve/...`` modules resolve without depending on the
+# Justfile's explicit ``--path:src --path:tests`` flags. This mirrors
+# how the other consumers (``isonim_freya/renderer``,
+# ``isonim_gpui/renderer``) are wired in via path extensions.
+switch("path", "$config/src")
+switch("path", "$config/tests")
 switch("path", "$config/../isonim/src")
 switch("path", "$config/../nim-everywhere/src")
 switch("path", "$config/../nim-stew")
