@@ -90,6 +90,7 @@ import ./android_adapter  ## re-exports `AndroidRenderer` /
                           ## `-d:android` builds, or the Linux-side
                           ## opaque placeholders otherwise.
 
+import ../element_tree_attrs
 import ../event_dispatch
 
 type
@@ -98,6 +99,19 @@ type
     ## receive the synthetic event. The composition root (or the
     ## bridge tests) supplies this callback so the adapter stays
     ## demo-agnostic.
+
+  HitChainTester* = proc(x, y: int): seq[AndroidElement]
+                     {.closure, gcsafe.}
+    ## FUH-M2. Resolves a coordinate into an ordered chain of
+    ## candidate fireable nodes (deepest first, then enclosing
+    ## ancestors). See ``gpui_input_adapter.HitChainTester`` for the
+    ## contract. The launcher composition root supplies this so the
+    ## adapter can fire ``"click"`` (on ``maClick``) or
+    ## ``"mouseenter"`` / ``"mouseleave"`` (on ``maMove``) on every
+    ## node in the chain. ``fireEvent`` is a no-op on nodes without a
+    ## registered listener, so the walk-up is safe to apply
+    ## unconditionally. See ``android_adapter.hitTestPath`` for the
+    ## canonical layout-based implementation.
 
   AndroidInputSink* = ref object
     ## `InputSink` impl. Holds a hit-test callback plus a structured
@@ -110,17 +124,42 @@ type
     ## checks use `target == 0` instead of `pointer(target) != nil`.
     ##
     ## EPP-M7. ``focusedNode`` slot mirrors GPUI / Freya / Cocoa.
+    ##
+    ## FUH-M2. ``hitChain`` mirrors the GPUI / Freya / Cocoa adapters
+    ## (FUH-M1 audit § 1 flagged Android as the only adapter without
+    ## this field at the EPP-M12 baseline). ``lastHoveredKey`` /
+    ## ``lastHoveredChain`` carry the throttle state for the hover
+    ## dispatch on ``maMove``; see ``gpui_input_adapter`` for the
+    ## stable-identity rationale.
     renderer*: AndroidRenderer
     hitTest*: HitTester
+    hitChain*: HitChainTester
     log*: seq[string]
     events*: seq[InputEvent]
     focusedNode*: AndroidElement
+    lastHoveredKey*: string
+    lastHoveredChain*: seq[AndroidElement]
 
 proc newAndroidInputSink*(renderer: AndroidRenderer;
-                          hitTest: HitTester): AndroidInputSink =
+                          hitTest: HitTester;
+                          hitChain: HitChainTester = nil): AndroidInputSink =
   AndroidInputSink(renderer: renderer, hitTest: hitTest,
+                   hitChain: hitChain,
                    log: @[], events: @[],
-                   focusedNode: AndroidElement(0))
+                   focusedNode: AndroidElement(0),
+                   lastHoveredKey: "",
+                   lastHoveredChain: @[])
+
+when defined(android) or defined(mockJni):
+  proc hoverKey(r: AndroidRenderer; node: AndroidElement): string =
+    ## FUH-M2: stable identity for the throttle. See
+    ## ``gpui_input_adapter``. Only meaningful when the renderer is
+    ## the real ``isonim_android/renderer`` (i.e. ``-d:android`` or
+    ## ``-d:mockJni``); on the plain Linux scaffold the renderer is
+    ## an empty placeholder with no ``getAttribute`` and the
+    ## throttle falls back to comparing the raw integer handle below.
+    if node == 0: return ""
+    r.getAttribute(node, ComponentPathAttr)
 
 proc actionToStr(a: MouseAction): string =
   case a
@@ -151,21 +190,74 @@ proc submit*(sink: AndroidInputSink; event: InputEvent) =
   of iekMouse:
     sink.log.add "mouse " & actionToStr(event.mouseAction) & " " &
       $event.mouseX & "," & $event.mouseY
-    if event.mouseAction == maClick and sink.hitTest != nil:
-      let target = sink.hitTest(event.mouseX, event.mouseY)
-      if target != 0:
-        # EPP-M7: track click target as implicit keyboard focus.
-        sink.focusedNode = target
-        when defined(android):
-          sink.renderer.fireEvent(target, "click")
+    if event.mouseAction == maClick:
+      # FUH-M2: prefer the chain hit-tester so the click reaches a
+      # fireable shadow-tree leaf even when the composition root
+      # itself has no click handler. Mirrors the EPP-M12 walk-up
+      # dispatch contract in the GPUI / Freya / Cocoa adapters.
+      if sink.hitChain != nil:
+        let chain = sink.hitChain(event.mouseX, event.mouseY)
+        if chain.len > 0:
+          sink.focusedNode = chain[0]
+          sink.log.add "hit-chain " & $chain.len
+          when defined(android) or defined(mockJni):
+            for node in chain:
+              if node != 0:
+                sink.renderer.fireEvent(node, "click")
+          else:
+            sink.log.add "hit-chain (linux scaffold; fireEvent deferred)"
+      elif sink.hitTest != nil:
+        let target = sink.hitTest(event.mouseX, event.mouseY)
+        if target != 0:
+          # EPP-M7: track click target as implicit keyboard focus.
+          sink.focusedNode = target
+          when defined(android) or defined(mockJni):
+            sink.renderer.fireEvent(target, "click")
+          else:
+            ## RS-M6 partial-linux: Android-runtime dispatch isn't
+            ## available on the Linux host. Record the hit-test
+            ## resolution so unit tests can still assert the
+            ## routing decision; the actual `fireEvent` call lands
+            ## when the macOS engineer takes the milestone on an
+            ## emulator host.
+            sink.log.add "hit (linux scaffold; fireEvent deferred)"
+    elif event.mouseAction == maMove and sink.hitChain != nil:
+      # FUH-M2 Phase A: hover dispatch. See the GPUI adapter for the
+      # rationale; the throttle and walk contract are identical. The
+      # ``fireEvent`` calls are gated on the Android runtime; the
+      # throttle bookkeeping still updates on the plain Linux host
+      # so unit tests (and the mockJni lane) can assert routing.
+      let chain = sink.hitChain(event.mouseX, event.mouseY)
+      let newKey =
+        when defined(android) or defined(mockJni):
+          if chain.len > 0: hoverKey(sink.renderer, chain[0])
+          else: ""
         else:
-          ## RS-M6 partial-linux: Android-runtime dispatch isn't
-          ## available on the Linux host. Record the hit-test
-          ## resolution so unit tests can still assert the routing
-          ## decision; the actual `fireEvent` call lands when the
-          ## macOS engineer takes the milestone on an emulator
-          ## host.
-          sink.log.add "hit (linux scaffold; fireEvent deferred)"
+          # Linux scaffold: no real renderer; fall back to the
+          # raw integer handle as a stable identity. The scaffold
+          # adapter only ever receives stub `AndroidElement` values
+          # so this is safe for the unit-test compile gate.
+          if chain.len > 0: $int64(chain[0])
+          else: ""
+      if newKey != sink.lastHoveredKey:
+        if sink.lastHoveredChain.len > 0:
+          sink.log.add "hover-leave " & $sink.lastHoveredChain.len
+          when defined(android) or defined(mockJni):
+            for node in sink.lastHoveredChain:
+              if node != 0:
+                sink.renderer.fireEvent(node, "mouseleave")
+          else:
+            sink.log.add "hover-leave (linux scaffold; fireEvent deferred)"
+        if chain.len > 0:
+          sink.log.add "hover-enter " & $chain.len
+          when defined(android) or defined(mockJni):
+            for node in chain:
+              if node != 0:
+                sink.renderer.fireEvent(node, "mouseenter")
+          else:
+            sink.log.add "hover-enter (linux scaffold; fireEvent deferred)"
+        sink.lastHoveredKey = newKey
+        sink.lastHoveredChain = chain
   of iekKey:
     sink.log.add "key " & actionToStr(event.keyAction) & " " & event.key
     # Android renderer has no synthetic keyboard primitive in

@@ -59,6 +59,7 @@ import std/strutils
 
 import isonim_cocoa/renderer
 
+import ../element_tree_attrs
 import ../event_dispatch
 
 type
@@ -93,6 +94,19 @@ type
     log*: seq[string]
     events*: seq[InputEvent]
     focusedNode*: CocoaElement
+    ## FUH-M2: hover-dispatch sink fields. Mirror of the GPUI adapter;
+    ## see ``gpui_input_adapter`` for the rationale. Uses the
+    ## ``ComponentPathAttr`` string as the stable identity for
+    ## throttle keying (Cocoa's ``CocoaElement = Id = distinct
+    ## pointer`` happens to round-trip stably through the renderer's
+    ## side-tables, but the string-key idiom matches GPUI / Freya so
+    ## a future renderer change can't silently break the throttle).
+    ## The ``fireEvent`` calls land inside a ``when defined(macosx)``
+    ## gate per the existing partial-Linux scaffold; the throttle
+    ## bookkeeping still updates on Linux so unit tests can assert
+    ## routing behaviour.
+    lastHoveredKey*: string
+    lastHoveredChain*: seq[CocoaElement]
 
 proc newCocoaInputSink*(renderer: CocoaRenderer;
                         hitTest: HitTester;
@@ -100,7 +114,14 @@ proc newCocoaInputSink*(renderer: CocoaRenderer;
   CocoaInputSink(renderer: renderer, hitTest: hitTest,
                  hitChain: hitChain,
                  log: @[], events: @[],
-                 focusedNode: default(CocoaElement))
+                 focusedNode: default(CocoaElement),
+                 lastHoveredKey: "",
+                 lastHoveredChain: @[])
+
+proc hoverKey(r: CocoaRenderer; node: CocoaElement): string =
+  ## FUH-M2: stable identity for the throttle. See ``gpui_input_adapter``.
+  if pointer(node) == nil: return ""
+  r.getAttribute(node, ComponentPathAttr)
 
 proc actionToStr(a: MouseAction): string =
   case a
@@ -162,6 +183,36 @@ proc submit*(sink: CocoaInputSink; event: InputEvent) =
             ## `fireEvent` call lands when the macOS engineer takes
             ## the milestone.
             sink.log.add "hit (linux scaffold; fireEvent deferred)"
+    elif event.mouseAction == maMove and sink.hitChain != nil:
+      # FUH-M2 Phase A: hover dispatch. See the GPUI adapter for the
+      # rationale; the throttle and walk contract are identical. The
+      # ``fireEvent`` calls are gated ``when defined(macosx)`` per
+      # the existing partial-Linux scaffold (the audit § 3.3
+      # documents the gate). The throttle bookkeeping still updates
+      # on Linux so unit tests can assert routing.
+      let chain = sink.hitChain(event.mouseX, event.mouseY)
+      let newKey =
+        if chain.len > 0: hoverKey(sink.renderer, chain[0])
+        else: ""
+      if newKey != sink.lastHoveredKey:
+        if sink.lastHoveredChain.len > 0:
+          sink.log.add "hover-leave " & $sink.lastHoveredChain.len
+          when defined(macosx):
+            for node in sink.lastHoveredChain:
+              if pointer(node) != nil:
+                sink.renderer.fireEvent(node, "mouseleave")
+          else:
+            sink.log.add "hover-leave (linux scaffold; fireEvent deferred)"
+        if chain.len > 0:
+          sink.log.add "hover-enter " & $chain.len
+          when defined(macosx):
+            for node in chain:
+              if pointer(node) != nil:
+                sink.renderer.fireEvent(node, "mouseenter")
+          else:
+            sink.log.add "hover-enter (linux scaffold; fireEvent deferred)"
+        sink.lastHoveredKey = newKey
+        sink.lastHoveredChain = chain
   of iekKey:
     sink.log.add "key " & actionToStr(event.keyAction) & " " & event.key
     # Cocoa renderer has no synthetic keyboard primitive in `fireEvent`

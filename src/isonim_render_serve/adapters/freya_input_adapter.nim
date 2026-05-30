@@ -38,6 +38,7 @@ import std/strutils
 
 import isonim_freya/renderer
 
+import ../element_tree_attrs
 import ../event_dispatch
 
 type
@@ -70,12 +71,25 @@ type
     log*: seq[string]
     events*: seq[InputEvent]
     focusedNode*: FreyaElement
+    ## FUH-M2: hover-dispatch sink fields. Mirror of the GPUI adapter;
+    ## see ``gpui_input_adapter`` for the rationale (including the
+    ## ``ComponentPathAttr``-based stable identity, since the Freya
+    ## shim has the same fresh-handle-per-call shape as GPUI).
+    lastHoveredKey*: string
+    lastHoveredChain*: seq[FreyaElement]
 
 proc newFreyaInputSink*(hitTest: HitTester;
                         hitChain: HitChainTester = nil): FreyaInputSink =
   FreyaInputSink(hitTest: hitTest, hitChain: hitChain,
                  log: @[], events: @[],
-                 focusedNode: nil)
+                 focusedNode: nil,
+                 lastHoveredKey: "",
+                 lastHoveredChain: @[])
+
+proc hoverKey(node: FreyaElement): string =
+  ## FUH-M2: stable identity for the throttle. See ``gpui_input_adapter``.
+  if node == nil: return ""
+  getAttribute(node, ComponentPathAttr)
 
 proc actionToStr(a: MouseAction): string =
   case a
@@ -125,6 +139,26 @@ proc submit*(sink: FreyaInputSink; event: InputEvent) =
           # EPP-M7: track click target as implicit keyboard focus.
           sink.focusedNode = target
           fireEvent(target, "click")
+    elif event.mouseAction == maMove and sink.hitChain != nil:
+      # FUH-M2 Phase A: hover dispatch. See the GPUI adapter for the
+      # rationale; the throttle and walk contract are identical.
+      let chain = sink.hitChain(event.mouseX, event.mouseY)
+      let newKey =
+        if chain.len > 0: hoverKey(chain[0])
+        else: ""
+      if newKey != sink.lastHoveredKey:
+        if sink.lastHoveredChain.len > 0:
+          sink.log.add "hover-leave " & $sink.lastHoveredChain.len
+          for node in sink.lastHoveredChain:
+            if node != nil:
+              fireEvent(node, "mouseleave")
+        if chain.len > 0:
+          sink.log.add "hover-enter " & $chain.len
+          for node in chain:
+            if node != nil:
+              fireEvent(node, "mouseenter")
+        sink.lastHoveredKey = newKey
+        sink.lastHoveredChain = chain
   of iekKey:
     sink.log.add "key " & actionToStr(event.keyAction) & " " & event.key
     # Freya shim has no keyboard primitive yet; surface to stderr so

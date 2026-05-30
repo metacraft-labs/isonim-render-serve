@@ -28,6 +28,7 @@ import std/strutils
 
 import isonim_gpui/renderer
 
+import ../element_tree_attrs
 import ../event_dispatch
 
 type
@@ -74,12 +75,40 @@ type
     log*: seq[string]
     events*: seq[InputEvent]
     focusedNode*: GpuiElement
+    ## FUH-M2: hover-dispatch sink fields. ``lastHoveredKey`` is the
+    ## ``ComponentPathAttr`` of the deepest leaf the cursor was over
+    ## on the prior ``maMove``; the adapter only re-fires
+    ## ``mouseleave`` / ``mouseenter`` when the key changes
+    ## (hit-test-based throttle per the FUH-M1 audit § 6.2). The
+    ## audit suggested a raw ``GpuiElement`` pointer comparison, but
+    ## the Rust shim allocates a fresh handle wrapper for every
+    ## ``nthChild`` call (see ``gpui-nim-shim::node_id_to_handle``),
+    ## so pointer equality is unstable across hit-test rebuilds.
+    ## The ComponentPath attribute is the canonical stable identity
+    ## the ETS-M2 manifest already uses; the same key disambiguates
+    ## logically equal nodes here. ``lastHoveredChain`` retains the
+    ## prior chain so the leave dispatch walks the same ancestor list
+    ## the enter dispatch walked, matching the EPP-M12 deepest-first
+    ## contract.
+    lastHoveredKey*: string
+    lastHoveredChain*: seq[GpuiElement]
 
 proc newGpuiInputSink*(hitTest: HitTester;
                        hitChain: HitChainTester = nil): GpuiInputSink =
   GpuiInputSink(hitTest: hitTest, hitChain: hitChain,
                 log: @[], events: @[],
-                focusedNode: nil)
+                focusedNode: nil,
+                lastHoveredKey: "",
+                lastHoveredChain: @[])
+
+proc hoverKey(node: GpuiElement): string =
+  ## FUH-M2: stable identity for the throttle. Returns the node's
+  ## ``ComponentPathAttr`` (the same key the ETS-M2 manifest uses)
+  ## when set, otherwise an empty string (treated as "unknown" — the
+  ## throttle will then re-fire conservatively rather than coalesce
+  ## unrelated leaves).
+  if node == nil: return ""
+  getAttribute(node, ComponentPathAttr)
 
 proc actionToStr(a: MouseAction): string =
   case a
@@ -136,6 +165,33 @@ proc submit*(sink: GpuiInputSink; event: InputEvent) =
           # land on the same leaf.
           sink.focusedNode = target
           fireEvent(target, "click")
+    elif event.mouseAction == maMove and sink.hitChain != nil:
+      # FUH-M2 Phase A: hover dispatch. Resolve the hit chain on
+      # every ``maMove``; fire ``"mouseleave"`` on the prior chain
+      # and ``"mouseenter"`` on the new chain only when the deepest
+      # leaf's ``ComponentPathAttr`` changes (hit-test-based
+      # throttle per FUH-M1 § 6.2; see ``hoverKey`` for the
+      # rationale on why pointer equality is unsafe here). The
+      # deepest-first walk mirrors the EPP-M12 click contract:
+      # ``fireEvent`` is a no-op on nodes with no listener, so the
+      # walk safely delivers to whichever ancestor owns the handler.
+      let chain = sink.hitChain(event.mouseX, event.mouseY)
+      let newKey =
+        if chain.len > 0: hoverKey(chain[0])
+        else: ""
+      if newKey != sink.lastHoveredKey:
+        if sink.lastHoveredChain.len > 0:
+          sink.log.add "hover-leave " & $sink.lastHoveredChain.len
+          for node in sink.lastHoveredChain:
+            if node != nil:
+              fireEvent(node, "mouseleave")
+        if chain.len > 0:
+          sink.log.add "hover-enter " & $chain.len
+          for node in chain:
+            if node != nil:
+              fireEvent(node, "mouseenter")
+        sink.lastHoveredKey = newKey
+        sink.lastHoveredChain = chain
   of iekKey:
     sink.log.add "key " & actionToStr(event.keyAction) & " " & event.key
     # GPUI shim has no keyboard primitive yet; surface to stderr so
