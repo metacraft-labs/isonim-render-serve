@@ -22,14 +22,15 @@ import ./isonim_render_serve/frame_source
 import ./isonim_render_serve/diff_region
 import ./isonim_render_serve/stub_frame_source
 import ./isonim_render_serve/element_tree_attrs
+import ./isonim_render_serve/element_tree_delta
 import ./isonim_render_serve/story_dispatch
 import ./isonim_render_serve/launcher_sinks
 import ./isonim_render_serve/adapters/h264_videotoolbox_encoder
 
 export packet, packet_video, packet_webp, ws_frame, event_dispatch,
        frame_source, diff_region, stub_frame_source,
-       element_tree_attrs, story_dispatch, launcher_sinks,
-       h264_videotoolbox_encoder
+       element_tree_attrs, element_tree_delta, story_dispatch,
+       launcher_sinks, h264_videotoolbox_encoder
 
 # ELT-M8: gate the WebP encoder adapter behind the
 # ``-d:withCodecWebP`` define per the campaign brief's

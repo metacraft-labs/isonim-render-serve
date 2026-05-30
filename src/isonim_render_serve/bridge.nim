@@ -40,6 +40,7 @@ import ./ws_frame
 import ./event_dispatch
 import ./frame_source
 import ./diff_region
+import ./element_tree_delta
 import ./adapters/h264_videotoolbox_encoder
 
 # ELT-M8: ekWebP gating. The encoder facade only compiles when
@@ -110,6 +111,19 @@ type
       ## launchers under RS-M11b/c). When set, the bridge advertises
       ## `capabilities.elementTree = true` in the `hello` packet and
       ## emits manifest M packets on connect + on change.
+    streamElementTreeDelta*: bool
+      ## ETS-M2: when true, the bridge advertises the
+      ## ``e/element-tree`` transport in the hello capability bag
+      ## and — provided the browser's hello-accept M packet echoes
+      ## that token back — switches the per-tick manifest emission
+      ## from the legacy ``element-tree`` full body to the new
+      ## ``element-tree-delta`` sub-kind defined in
+      ## ``element_tree_delta.nim``. Defaults to ``true`` when the
+      ## bridge is compiled with ``-d:withElementTreeDelta`` (the
+      ## dormant-code-on-loss gate per the audit's § 7.1 design);
+      ## otherwise ``false``, in which case the launcher emits the
+      ## legacy body unconditionally and the wire shape is
+      ## bit-for-bit identical to the pre-ETS-M2 path.
     capturePath*: string
       ## EPP-M4: optional self-describing capture-path identifier the
       ## bridge surfaces in the ``hello`` capability bag. The Cocoa
@@ -205,7 +219,8 @@ proc buildHelloJson*(backend: string; width, height: int;
                      capturePath: string = "";
                      encoder: EncoderKind = ekRawRgba;
                      codecId: string = "";
-                     webpAvailable: bool = false): string =
+                     webpAvailable: bool = false;
+                     elementTreeDelta: bool = false): string =
   ## Build the JSON body for the mandatory first M packet. RS-M0
   ## locks the schema:
   ##   { type: "hello", protocolVersion: 1, backend, capabilities,
@@ -244,6 +259,14 @@ proc buildHelloJson*(backend: string; width, height: int;
   # only has raw RGBA only the raw kind is listed.
   var transports = newJArray()
   discard webpAvailable  # quieten unused-param warning when ekWebP path is hit
+  # ETS-M2: when the launcher booted with -d:withElementTreeDelta
+  # (which propagates as ``elementTreeDelta = true`` through this
+  # builder), advertise the ``e/element-tree`` transport so the
+  # browser-side hello-accept reply can pin it. Token format mirrors
+  # ``v/avc1`` / ``w/webp`` / ``f/rgba``: a one-letter family prefix
+  # + a slash + the subkind.
+  if elementTreeDelta:
+    transports.add newJString(ElementTreeTransportToken)
   case encoder
   of ekWebP:
     # ELT-M8: when the launcher's primary encoder is ekWebP, the
@@ -318,6 +341,27 @@ type
       ## connection. Empty string means "no manifest sent yet"; the
       ## bridge always emits the first manifest after `hello` and
       ## before the first F packet.
+    prevElementTree: Option[ElementTreeManifest]
+      ## ETS-M2: per-connection snapshot of the last manifest the
+      ## bridge actually shipped to this client. Reused as the
+      ## `prev` input to ``computeElementTreeDelta`` when the
+      ## delta-stream gate is open. Distinct from `elementTreeKey`
+      ## (which is the dedup hash); the manifest itself is required
+      ## because the per-element diff needs the prev tuples in full.
+    elementSeq: uint32
+      ## ETS-M2: monotonic per-connection delta sequence counter.
+      ## Incremented on every emitted ``element-tree-delta`` M
+      ## packet so the browser can detect dropped deltas and
+      ## request a fresh snapshot. The seed manifest (which still
+      ## ships as the legacy ``element-tree`` body) doesn't bump
+      ## the counter — the first delta on the connection ships as
+      ## ``seq = 1``.
+    elementTreeDeltaAccepted: bool
+      ## ETS-M2: flipped to true when the browser's hello-accept
+      ## M packet includes ``e/element-tree`` in its accept list.
+      ## Until then the bridge stays on the legacy full-manifest
+      ## emission path, preserving backward compatibility for
+      ## consumers that don't recognise the new sub-kind.
     h264Encoder: H264EncoderHandle
       ## EPP-M5: per-connection mutable encoder handle. Seeded from
       ## ``BridgeConfig.encoderHandle`` on connect; mutated in place
@@ -357,13 +401,24 @@ type
       ## if the selector flipped back to F next tick).
 
 proc manifestKey(m: ElementTreeManifest): string =
-  ## Stable hash key over the (id, bounds) tuples of the manifest's
-  ## elements plus the surface dimensions. The bridge compares this
-  ## against `ConnectionState.elementTreeKey` and emits only on
-  ## change (RS-M11 cadence rule).
+  ## Stable hash key over the (id, kind, bounds) tuples of the
+  ## manifest's elements plus the surface dimensions. The bridge
+  ## compares this against `ConnectionState.elementTreeKey` and emits
+  ## only on change (RS-M11 cadence rule).
+  ##
+  ## ETS-M2 Part A: `kind` is included in the hash so launchers that
+  ## recategorise a node (e.g. ``row -> row-completed`` on completion
+  ## flip) cause a manifest re-emit. Pre-ETS-M2 the hash excluded
+  ## `kind` and such mutations were silently dropped, leaving the
+  ## browser-side overlay paint stale styling for affordance-coloured
+  ## nodes (comment-mode selection outline reads `kind` directly per
+  ## the ETS-M1 audit § 2). Bounds / id only changes still produce
+  ## emissions exactly as before — the hash is additive.
   result = $m.surfaceWidth & 'x' & $m.surfaceHeight & '|'
   for e in m.elements:
     result.add e.id
+    result.add ':'
+    result.add e.kind
     result.add ':'
     result.add $e.bounds.x
     result.add ','
@@ -391,7 +446,8 @@ proc sendHello(client: AsyncSocket; cfg: BridgeConfig;
                             capturePath = cfg.capturePath,
                             encoder = cfg.encoder,
                             codecId = codecId,
-                            webpAvailable = webpAvail)
+                            webpAvailable = webpAvail,
+                            elementTreeDelta = cfg.streamElementTreeDelta)
   let meta = MetaPacket(json: body)
   await sendBinary(client, encodeMeta(meta))
   state.helloSent = true
@@ -401,19 +457,52 @@ proc sendElementTreeIfChanged(client: AsyncSocket; cfg: BridgeConfig;
                               force: bool = false) {.async.} =
   ## RS-M11 cadence: emit an `element-tree` M packet when (a) we
   ## haven't yet sent one on this connection (force=true on first
-  ## emission), or (b) the (id, bounds) set has changed since the
-  ## last emission. Idle frames produce identical manifests and
+  ## emission), or (b) the (id, kind, bounds) set has changed since
+  ## the last emission. Idle frames produce identical manifests and
   ## therefore NO emission — that is the headline cadence invariant.
+  ##
+  ## ETS-M2: when the bridge was built with the delta gate on
+  ## (`cfg.streamElementTreeDelta`) AND the browser advertised the
+  ## ``e/element-tree`` transport in its hello-accept reply AND the
+  ## bridge has already shipped at least one full manifest on this
+  ## connection (so the browser has something to diff against), the
+  ## per-tick re-emit ships the new ``element-tree-delta``
+  ## M-subtype carrying only the per-element ops. The seed manifest
+  ## still ships in the legacy ``element-tree`` body so a connection
+  ## that goes "delta path immediately on hello" never happens — the
+  ## browser always sees one full snapshot before any delta.
   if cfg.elementTree == nil: return
   let manifest = cfg.elementTree.buildImpl()
   let key = manifestKey(manifest)
   if not force and key == state.elementTreeKey: return
-  let meta = encodeElementTreeMeta(manifest)
-  try:
-    await sendBinary(client, encodeMeta(meta))
-    state.elementTreeKey = key
-  except OSError, IOError:
-    discard
+  let useDelta = cfg.streamElementTreeDelta and
+                 state.elementTreeDeltaAccepted and
+                 state.prevElementTree.isSome
+  if useDelta:
+    let prev = state.prevElementTree.get
+    let ops = computeElementTreeDelta(prev, manifest)
+    # ``ops`` can legitimately be empty when manifestKey decides
+    # something changed but the per-field comparison in
+    # ``computeElementTreeDelta`` finds no surviving differences
+    # (e.g. surface dimensions changed alone). In that edge case
+    # we still emit a heartbeat-style packet with seq bumped so
+    # the browser's drop-detection counter stays aligned.
+    inc state.elementSeq
+    let meta = encodeElementTreeDeltaMeta(ops, state.elementSeq)
+    try:
+      await sendBinary(client, encodeMeta(meta))
+      state.elementTreeKey = key
+      state.prevElementTree = some(manifest)
+    except OSError, IOError:
+      discard
+  else:
+    let meta = encodeElementTreeMeta(manifest)
+    try:
+      await sendBinary(client, encodeMeta(meta))
+      state.elementTreeKey = key
+      state.prevElementTree = some(manifest)
+    except OSError, IOError:
+      discard
 
 const
   WebPChangeScoreThreshold* = 8
@@ -884,13 +973,29 @@ proc handleInbound(client: AsyncSocket; cfg: BridgeConfig;
         if cfg.inputSink != nil:
           cfg.inputSink.submit(ev)
       of 'M':
-        # Meta packets from client are accepted but unused at RS-M1.
+        # Client-originated M packets are decoded for the hello-accept
+        # transport selection (ETS-M2). Any decode failure still
+        # counts as a protocol violation per RS-M0; unrecognised
+        # subtypes are silently ignored.
+        var mpkt: MetaPacket
         try:
-          discard decodeMeta(raw)
+          mpkt = decodeMeta(raw)
         except PacketProtocolError as e:
           state.closed = true
           await sendClose(client, CloseProtocolError, e.msg)
           return
+        # ETS-M2: the browser's hello-accept reply may pin the
+        # ``e/element-tree`` transport. When it does, the bridge
+        # switches the per-tick manifest emission from the legacy
+        # full body to the new ``element-tree-delta`` sub-kind on
+        # the next change-detected emission. The flip is one-way
+        # per connection; a subsequent hello-accept can't downgrade
+        # because the browser-side cache only ever expands its
+        # decoder set.
+        if cfg.streamElementTreeDelta and
+           not state.elementTreeDeltaAccepted and
+           helloAcceptAcceptsElementTreeDelta(mpkt.json):
+          state.elementTreeDeltaAccepted = true
       else:
         state.closed = true
         await sendClose(client, CloseProtocolError,
@@ -901,6 +1006,9 @@ proc bridgeOnce(client: AsyncSocket; cfg: BridgeConfig) {.async.} =
   let state = ConnectionState(helloSent: false, closed: false,
                               lastSentFrame: none(Frame),
                               elementTreeKey: "",
+                              prevElementTree: none(ElementTreeManifest),
+                              elementSeq: 0,
+                              elementTreeDeltaAccepted: false,
                               h264Encoder: cfg.encoderHandle,
                               framesSent: 0,
                               prevFrameSample: @[],
