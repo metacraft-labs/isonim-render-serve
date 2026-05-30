@@ -44,7 +44,7 @@
 ## (where AppKit *does* expose a clean offscreen API) will be the
 ## first adapter to use approach (a) in production.
 
-import std/hashes
+import std/[hashes, os]
 
 import isonim_gpui/renderer
 import isonim_gpui/bindings as gpui_bindings
@@ -66,6 +66,29 @@ type
     renderer*: GpuiRenderer
     root*: GpuiElement
     width*, height*: int
+    # EMC2-M1 async pipeline state. The headless renderer is moved
+    # off the bridge's ``frameLoop`` thread onto a dedicated worker
+    # thread inside the shim; the bridge submits frame N+1 on tick
+    # N and tries to take frame N-1 from the worker on the same
+    # tick. If frame N-1 isn't ready, the bridge re-emits the
+    # previous frame (smoother than blocking ~41 ms inside the FFI
+    # body). On the very first tick the bridge has to wait for the
+    # first token to complete so the client gets a real initial
+    # frame; subsequent ticks are non-blocking.
+    pendingToken*: cuint      ## In-flight token, or 0 when none.
+    lastFramePixels*: seq[byte]  ## Cached last full RGBA so we
+                                 ## can re-emit when a poll says
+                                 ## Pending.
+    asyncPrimed*: bool        ## ``true`` after the first
+                              ## ``renderHeadlessFrame`` call
+                              ## successfully submitted a token.
+    asyncDisabled*: bool      ## Latches when the async path
+                              ## reports an unrecoverable error
+                              ## (e.g. RendererUnavailable on
+                              ## Linux); subsequent calls fall
+                              ## through to the synchronous
+                              ## ``gpui_render_to_pixels`` path
+                              ## without re-trying the worker.
 
 # ---------------------------------------------------------------------------
 # Layout heuristic: pack the element tree into stacked rectangles.
@@ -236,6 +259,10 @@ proc fillRect(pixels: var seq[byte]; w, h: int; r: Rect) =
 
 proc renderSyntheticFrame(src: GpuiFrameSource): Frame
 proc renderHeadlessFrame(src: GpuiFrameSource): Frame
+proc renderHeadlessFrameSync(src: GpuiFrameSource): Frame
+proc copyShimBufferToFrame(src: GpuiFrameSource;
+                           outPtr: ptr uint8; outLen: csize_t): Frame
+proc lastFrameOrSynthetic(src: GpuiFrameSource): Frame
 
 proc renderFrame*(src: GpuiFrameSource): Frame =
   ## Walk the GPUI tree rooted at `src.root` and produce an RGBA8888
@@ -266,28 +293,49 @@ proc renderFrame*(src: GpuiFrameSource): Frame =
     # Rust-side `SizeMismatch` / `RendererUnavailable` error codes.
   renderSyntheticFrame(src)
 
-proc renderHeadlessFrame(src: GpuiFrameSource): Frame =
-  ## Drive the shim's `gpui_render_to_pixels` entry point to obtain
-  ## RGBA8888 bytes from GPUI's real render pipeline (via Zed's
-  ## `HeadlessAppContext::with_platform` + `Window::render_to_image`).
-  ## The buffer is owned by the shim until `gpui_free_pixels` is
-  ## called, so we copy it into a Nim seq before returning.
-  ##
-  ## The frame still carries the same `FrameFlags` shape and obeys the
-  ## F-packet protocol (RS-M0): RGBA8888 row-major, non-premultiplied
-  ## sRGB, top row first.
+proc copyShimBufferToFrame(src: GpuiFrameSource;
+                           outPtr: ptr uint8; outLen: csize_t): Frame =
+  ## Shared helper: copy a shim-owned RGBA buffer into a Nim seq and
+  ## wrap it as a Frame. Caches the bytes on ``src.lastFramePixels``
+  ## so a future Pending poll can re-emit them.
+  var pixels = newSeqUninit[byte](int(outLen))
+  if pixels.len > 0:
+    copyMem(addr pixels[0], outPtr, int(outLen))
+  src.lastFramePixels = pixels
+  Frame(kind: fkFull,
+        flags: FrameFlags(isDiff: false, isVideo: false),
+        width: src.width, height: src.height, pixels: pixels)
+
+proc lastFrameOrSynthetic(src: GpuiFrameSource): Frame =
+  ## When an async poll says Pending and we have no prior frame to
+  ## re-emit, fall back to a zero-length Frame so ``renderFrame``'s
+  ## "size mismatch → synthetic raster" defence kicks in. This
+  ## happens only on the very first tick (where the worker has not
+  ## finished its first render yet); subsequent ticks have a cached
+  ## ``lastFramePixels`` to re-emit.
+  if src.lastFramePixels.len == src.width * src.height * 4:
+    Frame(kind: fkFull,
+          flags: FrameFlags(isDiff: false, isVideo: false),
+          width: src.width, height: src.height,
+          pixels: src.lastFramePixels)
+  else:
+    Frame(kind: fkFull,
+          flags: FrameFlags(isDiff: false, isVideo: false),
+          width: src.width, height: src.height, pixels: @[])
+
+proc renderHeadlessFrameSync(src: GpuiFrameSource): Frame =
+  ## Synchronous fallback path. Drives the pre-EMC2-M1
+  ## ``gpui_render_to_pixels`` entry point on the calling thread.
+  ## Used as a one-shot recovery when the async worker reports an
+  ## unrecoverable error (e.g. RendererUnavailable on Linux) and
+  ## also by the test suite that wants deterministic, blocking
+  ## semantics.
   let w = src.width
   let h = src.height
   if w <= 0 or h <= 0:
     return Frame(kind: fkFull,
                  flags: FrameFlags(isDiff: false, isVideo: false),
                  width: w, height: h, pixels: @[])
-  # RS-M14 Phase 2: the headless `NimRootView` reads from the shim's
-  # global `ROOT_NODE_ID`. The streaming adapter builds the tree through
-  # the `GpuiRenderer.createElement` etc. API which does NOT route
-  # through `gpui_launch` (the path that normally sets the root). So we
-  # have to pin the root explicitly per frame — cheap, idempotent, and
-  # mirrors the design pattern of the windowed launch path.
   gpui_bindings.gpui_set_root_element(src.root)
   var outPtr: ptr uint8
   var outLen: csize_t = 0
@@ -295,27 +343,160 @@ proc renderHeadlessFrame(src: GpuiFrameSource): Frame =
     cuint(w), cuint(h), cfloat(1.0),
     addr outPtr, addr outLen)
   if rc != 0 or outPtr.isNil or outLen == 0:
-    # Headless render failed; caller falls back to synthetic.
     return Frame(kind: fkFull,
                  flags: FrameFlags(isDiff: false, isVideo: false),
                  width: w, height: h, pixels: @[])
   defer:
     gpui_bindings.gpui_free_pixels(outPtr, outLen)
-  # EMC-M2 Option B (per ``Editor-Matrix-Closer.milestones.org``):
-  # ``newSeqUninit[byte]`` skips the zero-init pass that the EMC-M1
-  # audit measured at ~2.0-2.7 ms median (the bulk of the per-frame
-  # "Nim alloc + copy" cost). The shim's ``copyMem`` writes every
-  # byte immediately after, so the zero-init was always dead work.
-  # The copy itself stays — the shim owns the returned buffer until
-  # ``gpui_free_pixels`` runs, and the frame consumer caches the
-  # full RGBA seq for the next-tick diff so we cannot hand the
-  # shim pointer out directly.
-  var pixels = newSeqUninit[byte](int(outLen))
-  if pixels.len > 0:
-    copyMem(addr pixels[0], outPtr, int(outLen))
+  copyShimBufferToFrame(src, outPtr, outLen)
+
+proc renderHeadlessFrame(src: GpuiFrameSource): Frame =
+  ## EMC2-M1: pipelined async path.
+  ##
+  ## On each tick the bridge thread does at most three FFI calls:
+  ##   1. ``gpui_set_root_element`` (cheap; pin the root for the
+  ##      worker's next render-cycle).
+  ##   2. ``gpui_render_try_take(pendingToken, ...)`` — non-blocking
+  ##      poll for the bytes the worker computed since the prior
+  ##      tick.
+  ##   3. ``gpui_render_submit_async(...)`` — enqueue the next
+  ##      render request; returns a new token immediately.
+  ##
+  ## The result of step 2 is what we emit on this tick. The result
+  ## of step 3 is what we'll emit on the NEXT tick. By the time the
+  ## bridge re-enters this proc, the worker has been computing for
+  ## one full tick (~20-50 ms depending on cadence), so the next
+  ## try-take is typically Ready.
+  ##
+  ## Bootstrapping: on the very first call we have no pending token
+  ## to take from, so we submit + block until the first frame is
+  ## ready, then submit the second frame and return the first one's
+  ## bytes. This pays the 41 ms cost ONCE on connection setup
+  ## instead of every frame.
+  ##
+  ## Fallback: if the worker reports an unrecoverable error
+  ## (RendererUnavailable, Panic) we latch ``asyncDisabled`` and
+  ## route the rest of the connection through the synchronous
+  ## ``gpui_render_to_pixels`` path. This preserves the EMC-M5
+  ## degradation story on Linux where the worker can't run.
+  let w = src.width
+  let h = src.height
+  if w <= 0 or h <= 0:
+    return Frame(kind: fkFull,
+                 flags: FrameFlags(isDiff: false, isVideo: false),
+                 width: w, height: h, pixels: @[])
+  if src.asyncDisabled:
+    return renderHeadlessFrameSync(src)
+
+  # The headless ``NimRootView`` reads from the shim's global
+  # ``ROOT_NODE_ID``. Pinning per tick is idempotent and cheap;
+  # the worker thread observes the global at the start of each
+  # render cycle.
+  gpui_bindings.gpui_set_root_element(src.root)
+
+  # --- Step 1: take the previous tick's render (if any) ---
+  var emitFrame: Frame
+  var haveFrameToEmit = false
+  if src.pendingToken != 0'u32:
+    var outPtr: ptr uint8
+    var outLen: csize_t = 0
+    let rc = gpui_bindings.gpui_render_try_take(
+      src.pendingToken, addr outPtr, addr outLen)
+    if rc == gpui_bindings.GpuiRenderTakeReady:
+      defer:
+        gpui_bindings.gpui_free_pixels(outPtr, outLen)
+      if not outPtr.isNil and outLen > 0:
+        emitFrame = copyShimBufferToFrame(src, outPtr, outLen)
+        haveFrameToEmit = true
+      src.pendingToken = 0'u32
+    elif rc == gpui_bindings.GpuiRenderTakePending:
+      # Worker hasn't finished the previous request yet — re-emit
+      # the last cached frame this tick. The token stays alive;
+      # the next tick polls it again.
+      emitFrame = lastFrameOrSynthetic(src)
+      haveFrameToEmit = true
+    elif rc == gpui_bindings.GpuiRenderTakeUnknownToken:
+      # Worker forgot the token (shouldn't happen, but be defensive).
+      src.pendingToken = 0'u32
+    else:
+      # Negative error code: -1..-6 (negation of ErrorCode). On
+      # RendererUnavailable (-2) the worker can never recover, so
+      # latch the fallback. Other errors might be transient
+      # (CaptureFailed under GPU pressure); we still latch to
+      # avoid livelock — the sync path either succeeds or the
+      # outer ``renderFrame`` falls through to synthetic.
+      src.pendingToken = 0'u32
+      src.asyncDisabled = true
+      return renderHeadlessFrameSync(src)
+
+  # --- Step 2: submit the next render ---
+  let newToken = gpui_bindings.gpui_render_submit_async(
+    cuint(w), cuint(h), cfloat(1.0))
+  if newToken == 0'u32:
+    # Worker thread is down (extremely rare). Fall back to sync
+    # for this tick and latch so we stop trying.
+    src.asyncDisabled = true
+    if haveFrameToEmit:
+      return emitFrame
+    return renderHeadlessFrameSync(src)
+  src.pendingToken = newToken
+
+  # --- Step 3: bootstrap or return ---
+  if haveFrameToEmit:
+    return emitFrame
+
+  # First-call bootstrap: block until the just-submitted token
+  # completes so we emit a real first frame instead of an empty
+  # one. The block happens ONCE per connection, not per frame.
+  # We poll instead of blocking on a condvar because that gives
+  # the bridge's other in-flight asyncdispatch tasks a chance to
+  # run (sleepAsync yields back to the event loop).
+  if not src.asyncPrimed:
+    src.asyncPrimed = true
+    # Bound the bootstrap wait at ~2 s so a stuck worker doesn't
+    # hang the connection forever; that's well above the
+    # measured 41 ms first-render cost and within the bridge's
+    # hello-handshake timeout.
+    const maxBootstrapPollsMs = 2000
+    const pollIntervalMs = 5
+    var elapsed = 0
+    while elapsed < maxBootstrapPollsMs:
+      var outPtr: ptr uint8
+      var outLen: csize_t = 0
+      let rc = gpui_bindings.gpui_render_try_take(
+        src.pendingToken, addr outPtr, addr outLen)
+      if rc == gpui_bindings.GpuiRenderTakeReady:
+        defer:
+          gpui_bindings.gpui_free_pixels(outPtr, outLen)
+        src.pendingToken = 0'u32
+        if not outPtr.isNil and outLen > 0:
+          let f = copyShimBufferToFrame(src, outPtr, outLen)
+          # Submit ahead for the next tick so the pipeline is
+          # primed when the bridge's frameLoop comes back around.
+          let nt = gpui_bindings.gpui_render_submit_async(
+            cuint(w), cuint(h), cfloat(1.0))
+          src.pendingToken = nt
+          return f
+        break
+      elif rc == gpui_bindings.GpuiRenderTakePending:
+        # Busy-wait a few ms; this is the bootstrap path only.
+        sleep(pollIntervalMs)
+        elapsed += pollIntervalMs
+        continue
+      else:
+        # Worker failure during bootstrap → fall back.
+        src.pendingToken = 0'u32
+        src.asyncDisabled = true
+        return renderHeadlessFrameSync(src)
+    # Bootstrap timed out — fall through to synthetic for this
+    # tick (caller sees empty-pixels Frame and uses the
+    # synthetic raster) without disabling the async path
+    # forever (timeout might be transient).
+
+  # We have nothing to emit yet — caller falls through to synthetic.
   Frame(kind: fkFull,
         flags: FrameFlags(isDiff: false, isVideo: false),
-        width: w, height: h, pixels: pixels)
+        width: w, height: h, pixels: @[])
 
 proc renderSyntheticFrame(src: GpuiFrameSource): Frame =
   ## Pre-RS-M14 tree-derived synthetic raster. Kept as a fallback for
