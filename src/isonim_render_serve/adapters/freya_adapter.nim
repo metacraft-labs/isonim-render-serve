@@ -237,7 +237,27 @@ proc walkLayout(node: FreyaElement; x, y, w, h: int;
     if bodyW <= 0 or bodySpanH <= 0 or childTotalH <= 0: return
     let flexTotal = max(0, childTotalH - fixedTotal)
     let perFlex = if flexCount > 0: max(1, flexTotal div flexCount) else: 0
-    var cy = bodyY
+    # EMC2-M3: ``data-justify="space-around"`` opt-in. When all
+    # children are size-pinned (``flexCount == 0``) and there is
+    # leftover main-axis space, distribute that leftover as equal
+    # padding before / between / after the children. Mirrors CSS
+    # ``justify-content: space-around`` semantics. The task_app
+    # freya leaves set this on the ``<ul>`` task list so the rows
+    # spread across the available list height at narrow viewports
+    # (Phone 390x844) instead of packing at the top — this makes
+    # the editor's hover-label hit-test resolve to DIFFERENT rows
+    # for jittered cursor positions, which the EMC-M4 / FUH-M8
+    # matrix harness needs to capture non-null hover samples. See
+    # ``codetracer-specs/.../Editor-Matrix-Closer-2.milestones.org``
+    # § EMC2-M3 for the per-cell rationale.
+    let justify = getAttribute(node, "data-justify")
+    let spaceAround = justify == "space-around" and flexCount == 0 and
+                      flexTotal > 0
+    let perGap =
+      if spaceAround:
+        flexTotal div (count + 1)
+      else: 0
+    var cy = bodyY + perGap
     for i in 0 ..< count:
       let child = nthChild(node, i)
       if child == nil: continue
@@ -254,7 +274,7 @@ proc walkLayout(node: FreyaElement; x, y, w, h: int;
           perFlex
       if ch <= 0: break
       walkLayout(child, bodyX, cy, bodyW, ch, rects, depth + 1, maxDepth)
-      cy += ch + gap
+      cy += ch + gap + perGap
 
 proc buildLayoutRects*(root: FreyaElement; width, height: int):
                       seq[LayoutRect] =

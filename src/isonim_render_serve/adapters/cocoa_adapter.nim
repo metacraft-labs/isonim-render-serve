@@ -577,7 +577,24 @@ when defined(macosx):
       if bodyH <= 0 or childTotalH <= 0: return
       let flexTotal = max(0, childTotalH - fixedTotal)
       let perFlex = if flexCount > 0: max(1, flexTotal div flexCount) else: 0
-      var cy = bodyY
+      # EMC2-M3: ``data-justify="space-around"`` opt-in. Mirror of
+      # the freya adapter's same-attribute hook. When all children
+      # are size-pinned (``flexCount == 0``) AND leftover main-axis
+      # space exists, distribute it as equal padding around the
+      # children. The task_app cocoa leaves set this on the task
+      # list so rows spread across the list height at narrow
+      # viewports — restores hover-label hit-test coverage that
+      # the EMC-M4 / FUH-M8 matrix harness expects. See
+      # ``codetracer-specs/.../Editor-Matrix-Closer-2.milestones.org``
+      # § EMC2-M3.
+      let justify = r.getAttribute(node, "data-justify")
+      let spaceAround = justify == "space-around" and flexCount == 0 and
+                        flexTotal > 0
+      let perGap =
+        if spaceAround:
+          flexTotal div (count + 1)
+        else: 0
+      var cy = bodyY + perGap
       # M-EVP-14 Wave W (W-1 fix): in vertical layout the main axis is
       # height, so ``data-fixed-height`` is the size-along-axis hint
       # honoured by the pre-pass above. ``data-fixed-width`` is the
@@ -630,7 +647,7 @@ when defined(macosx):
         # parent's tint visible as a card edge.
         layoutTreeForCapture(r, child, h, childX, cy, childW, ch,
                              depth + 1, maxDepth, propagateBg)
-        cy += ch + gap
+        cy += ch + gap + perGap
 
   proc renderFrame*(src: CocoaFrameSource): Frame =
     ## Capture the rendered Cocoa tree rooted at `src.root` into an
@@ -911,7 +928,19 @@ proc walkLayout(r: CocoaRenderer; node: CocoaElement; x, y, w, h: int;
     if bodyW <= 0 or bodySpanH <= 0 or childTotalH <= 0: return
     let flexTotal = max(0, childTotalH - fixedTotal)
     let perFlex = if flexCount > 0: max(1, flexTotal div flexCount) else: 0
-    var cy = bodyY
+    # EMC2-M3: ``data-justify="space-around"`` opt-in (mirror of the
+    # render-side ``layoutTreeForCapture`` + freya adapter logic).
+    # Used by the task_app cocoa task list so rows spread across the
+    # list height at Phone, restoring hover-label hit-test coverage
+    # the EMC-M4 / FUH-M8 matrix harness expects. See spec EMC2-M3.
+    let justify = r.getAttribute(node, "data-justify")
+    let spaceAround = justify == "space-around" and flexCount == 0 and
+                      flexTotal > 0
+    let perGap =
+      if spaceAround:
+        flexTotal div (count + 1)
+      else: 0
+    var cy = bodyY + perGap
     for i in 0 ..< count:
       let child = r.nthChild(node, i)
       if isNilElement(child): continue
@@ -941,7 +970,7 @@ proc walkLayout(r: CocoaRenderer; node: CocoaElement; x, y, w, h: int;
           childX = bodyX + (bodyW - childW)
       walkLayout(r, child, childX, cy, childW, ch, rects,
                  depth + 1, maxDepth)
-      cy += ch + gap
+      cy += ch + gap + perGap
 
 proc buildLayoutRects*(r: CocoaRenderer; root: CocoaElement;
                        width, height: int): seq[LayoutRect] =
