@@ -116,6 +116,22 @@ proc colourForTag(tag, label: string): tuple[r, g, b: uint8] =
               uint8((h shr 8) and 0xFF),
               uint8((h shr 16) and 0xFF))
 
+proc colourForKind(kind: string): tuple[applied: bool; r, g, b: uint8] =
+  ## EMC2-M2. Map ``ElementKindAttr`` values that carry an interactive
+  ## state hint onto distinct background tints. Returns ``applied=false``
+  ## for kinds that don't override the tag-derived palette. Mirror of
+  ## the GPUI adapter's helper (see ``gpui_adapter.colourForKind`` for
+  ## the matrix-ROI fingerprint rationale).
+  case kind
+  of "row-hovered":
+    (true, 0x22'u8, 0x22'u8, 0xAA'u8)
+  of "row-pressed":
+    (true, 0xCC'u8, 0x88'u8, 0x22'u8)
+  of "row-completed":
+    (true, 0x33'u8, 0x88'u8, 0x44'u8)
+  else:
+    (false, 0'u8, 0'u8, 0'u8)
+
 proc parsePxAttr(s: string): int =
   ## Parse an integer pixel attribute like "120" or "120px". Returns 0
   ## when the value is empty or unparseable; the layout caller treats
@@ -379,8 +395,17 @@ proc renderSyntheticFrame(src: FreyaFrameSource): Frame =
   if src.root != nil:
     let layoutRects = buildLayoutRects(src.root, w, h)
     for lr in layoutRects:
-      let (cr, cg, cb) = colourForTag(lr.tag, lr.label)
-      let alpha = 0xFFu8 - uint8(min(lr.depth * 16, 0xC0))
+      var (cr, cg, cb) = colourForTag(lr.tag, lr.label)
+      var alpha = 0xFFu8 - uint8(min(lr.depth * 16, 0xC0))
+      # EMC2-M2: ElementKindAttr -> paint binding. Honour interactive-
+      # state kinds (``row-hovered`` / ``row-pressed`` / ``row-completed``)
+      # so the matrix's fingerprint ROI registers a paint change when
+      # the task_app flips a row's kind. See the GPUI adapter's
+      # ``colourForKind`` for the matrix-ROI fingerprint rationale.
+      let kindOverride = colourForKind(getAttribute(lr.node, ElementKindAttr))
+      if kindOverride.applied:
+        cr = kindOverride.r; cg = kindOverride.g; cb = kindOverride.b
+        alpha = 0xFF'u8
       fillRect(pixels, w, h, Rect(x: lr.x, y: lr.y, w: lr.w, h: lr.h,
                                   r: cr, g: cg, b: cb, a: alpha,
                                   label: lr.label))

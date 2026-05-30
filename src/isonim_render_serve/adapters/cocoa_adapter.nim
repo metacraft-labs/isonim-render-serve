@@ -370,6 +370,25 @@ when defined(macosx):
     }
     """.}
 
+  proc colourForKind(kind: string):
+                    tuple[applied: bool; r, g, b, a: cdouble] =
+    ## EMC2-M2. Map ``ElementKindAttr`` values that carry an interactive
+    ## state hint onto distinct NSLayer background colours. Mirror of
+    ## the GPUI / Freya adapters' ``colourForKind`` helpers — see
+    ## ``gpui_adapter.colourForKind`` for the matrix-ROI fingerprint
+    ## rationale. The cocoa adapter expresses colours in sRGB 0..1
+    ## space because ``setLayerBackgroundColor`` calls
+    ## ``+[NSColor colorWithRed:green:blue:alpha:]`` directly.
+    case kind
+    of "row-hovered":
+      (true, 0.133, 0.133, 0.667, 1.0)  ## ~0x22/0x22/0xAA
+    of "row-pressed":
+      (true, 0.800, 0.533, 0.133, 1.0)  ## ~0xCC/0x88/0x22
+    of "row-completed":
+      (true, 0.200, 0.533, 0.267, 1.0)  ## ~0x33/0x88/0x44
+    else:
+      (false, 0.0, 0.0, 0.0, 0.0)
+
   proc neutralTint(depth: int): tuple[r, g, b, a: cdouble] =
     ## Neutral dark-grey palette keyed to tree depth. Every level
     ## gets a slightly different shade so nested containers remain
@@ -462,7 +481,20 @@ when defined(macosx):
     cocoa_autolayout.setFrame(view, cdouble(x), cdouble(nsY),
                               cdouble(w), cdouble(h))
     let selfHasExplicitBg = r.hasExplicitBackground(node)
-    if not selfHasExplicitBg and not parentHasExplicitBg:
+    # EMC2-M2: ElementKindAttr -> paint binding. The kind override
+    # takes priority over both the depth-keyed neutral tint and any
+    # leaf-set explicit background — the interactive-state kind IS the
+    # paint signal the matrix's fingerprint ROI watches for. Without
+    # this, ``layoutTreeForCapture`` left the row's layer at whatever
+    # background the leaf assigned at construction, so an
+    # ``ElementKindAttr`` flip from ``"row"`` to ``"row-hovered"``
+    # produced no visible AppKit paint change and the matrix's
+    # click-response measurement read ``null``.
+    let kindOverride = colourForKind(r.getAttribute(node, ElementKindAttr))
+    if kindOverride.applied:
+      setLayerBackgroundColor(view, kindOverride.r, kindOverride.g,
+                              kindOverride.b, kindOverride.a)
+    elif not selfHasExplicitBg and not parentHasExplicitBg:
       let tint = neutralTint(depth)
       setLayerBackgroundColor(view, tint.r, tint.g, tint.b, tint.a)
     let count = r.childCount(node)

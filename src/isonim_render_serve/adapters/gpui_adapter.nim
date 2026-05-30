@@ -145,6 +145,34 @@ proc colourForTag(tag, label: string): tuple[r, g, b: uint8] =
               uint8((h shr 8) and 0xFF),
               uint8((h shr 16) and 0xFF))
 
+proc colourForKind(kind: string): tuple[applied: bool; r, g, b: uint8] =
+  ## EMC2-M2. Map ``ElementKindAttr`` values that carry an interactive
+  ## state hint onto distinct background tints. Returns ``applied=false``
+  ## for kinds that don't override the tag-derived palette, so callers
+  ## can fall through to ``colourForTag``.
+  ##
+  ## The matrix's 128x128 fingerprint ROI sums R/G/B across 1024 sub-
+  ## samples (see ``e2e_editor_full_acceptance_matrix_live.mjs``'s
+  ## ``measureClickResponse``); a per-channel shift of >=32 lifts the
+  ## ROI fingerprint comfortably above the noise floor.
+  case kind
+  of "row-hovered":
+    ## Cool indigo accent vs the default ``li`` row palette
+    ## (0x55/0x55/0x77) — the red/green channels drop by 0x33 and the
+    ## blue lifts to 0xAA so all three channels move > 32.
+    (true, 0x22'u8, 0x22'u8, 0xAA'u8)
+  of "row-pressed":
+    ## Warm amber accent — pulls the row even further from both
+    ## ``row`` and ``row-hovered`` along the R/G axes so the matrix's
+    ## click-response fingerprint differs from a hover transition.
+    (true, 0xCC'u8, 0x88'u8, 0x22'u8)
+  of "row-completed":
+    ## Green tint — mirror the historical task_app convention so
+    ## completion is visually distinguishable from hover/press.
+    (true, 0x33'u8, 0x88'u8, 0x44'u8)
+  else:
+    (false, 0'u8, 0'u8, 0'u8)
+
 proc walkLayout(node: GpuiElement; x, y, w, h: int;
                 rects: var seq[LayoutRect]; depth = 0; maxDepth = 8) =
   ## DFS that produces one ``LayoutRect`` per visited element. The
@@ -539,6 +567,17 @@ proc renderSyntheticFrame(src: GpuiFrameSource): Frame =
           cr = 0x7C'u8; cg = 0x7A'u8; cb = 0xED'u8
         else:
           cr = 0x2A'u8; cg = 0x2A'u8; cb = 0x3A'u8
+        alpha = 0xFF'u8
+      # EMC2-M2: ElementKindAttr -> paint binding. Honour interactive-
+      # state kinds (``row-hovered`` / ``row-pressed`` / ``row-completed``)
+      # so the matrix's click/hover fingerprint ROI registers a paint
+      # change when the task_app flips a row's kind. Overrides the
+      # ariaPressed / toggle paths above because state changes that
+      # arrive via ElementKindAttr are higher-fidelity signals than
+      # the legacy attribute-derived heuristics.
+      let kindOverride = colourForKind(getAttribute(lr.node, ElementKindAttr))
+      if kindOverride.applied:
+        cr = kindOverride.r; cg = kindOverride.g; cb = kindOverride.b
         alpha = 0xFF'u8
       fillRect(pixels, w, h, Rect(x: lr.x, y: lr.y, w: lr.w, h: lr.h,
                                   r: cr, g: cg, b: cb, a: alpha,

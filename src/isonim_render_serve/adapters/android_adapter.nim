@@ -269,6 +269,20 @@ type
     mode*: AndroidCaptureMode
     deviceSerial*: string  ## ignored unless mode == acmScreencap
 
+  LayoutRect* = object
+    ## Per-node layout entry. Mirror of the GPUI / Freya / Cocoa
+    ## adapter's ``LayoutRect`` shape.
+    ##
+    ## Hoisted above the ``when defined(android) or defined(mockJni)``
+    ## body so EMC2-M2's renderFrame mockJni branch can name the type
+    ## in its ``buildLayoutRects`` forward declaration. The renderer-
+    ## specific helpers that produce / consume these entries are still
+    ## gated on the renderer-import block below.
+    node*: AndroidElement
+    x*, y*, w*, h*: int
+    depth*: int
+    tag*, label*: string
+
 when defined(android) or defined(mockJni):
   ## Android implementation — drives the real `View.draw(Canvas)` ->
   ## `Bitmap` -> ARGB->RGBA capture path from inside the Android
@@ -299,6 +313,85 @@ when defined(android) or defined(mockJni):
   ## capture is the binding RS-M6 acceptance gate and is exercised
   ## by `isonim-android/app/src/androidTest/kotlin/com/metacraft/
   ## isonim/examples/AdapterCaptureTest.kt`.
+
+  proc colourForKind(kind: string):
+                    tuple[applied: bool; r, g, b: uint8] =
+    ## EMC2-M2. Map ``ElementKindAttr`` values that carry an interactive
+    ## state hint onto distinct RGB triplets. Mirror of GPUI / Freya /
+    ## Cocoa adapters' ``colourForKind`` helpers — see
+    ## ``gpui_adapter.colourForKind`` for the matrix-ROI fingerprint
+    ## rationale.
+    case kind
+    of "row-hovered":
+      (true, 0x22'u8, 0x22'u8, 0xAA'u8)
+    of "row-pressed":
+      (true, 0xCC'u8, 0x88'u8, 0x22'u8)
+    of "row-completed":
+      (true, 0x33'u8, 0x88'u8, 0x44'u8)
+    else:
+      (false, 0'u8, 0'u8, 0'u8)
+
+  proc fillRect(pixels: var seq[byte]; w, h: int;
+                x, y, rectW, rectH: int;
+                r, g, b: uint8) =
+    ## Opaque rectangle blit. Clips against the buffer bounds; mirrors
+    ## the helper used by the GPUI / Freya synthetic rasterisers, but
+    ## without the source-over alpha blend pass — the mockJni path
+    ## paints kind tints at full opacity so the fingerprint ROI sees
+    ## the largest possible delta vs the underlying dark-grey fill.
+    let x0 = max(0, x)
+    let y0 = max(0, y)
+    let x1 = min(w, x + rectW)
+    let y1 = min(h, y + rectH)
+    if x1 <= x0 or y1 <= y0: return
+    for yy in y0 ..< y1:
+      var off = (yy * w + x0) * 4
+      for _ in x0 ..< x1:
+        pixels[off] = r
+        pixels[off + 1] = g
+        pixels[off + 2] = b
+        pixels[off + 3] = 0xFF'u8
+        off += 4
+
+  # Layout walker — moved above ``renderFrame`` (was previously only
+  # declared inside the RS-M11c manifest-builder block below) so the
+  # mockJni renderFrame branch can call it without a forward
+  # declaration. The walker is renderer-state-free DFS; same
+  # vertical-stack heuristic as the GPUI / Freya / Cocoa adapters use.
+  proc walkLayout(r: AndroidRenderer; node: AndroidElement;
+                  x, y, w, h: int;
+                  rects: var seq[LayoutRect]; depth = 0;
+                  maxDepth = 8) =
+    ## DFS that produces one ``LayoutRect`` per visited element.
+    if node == 0 or w <= 0 or h <= 0: return
+    if depth > maxDepth: return
+    let cls = r.getAttribute(node, "class")
+    let txt = r.textContent(node)
+    rects.add LayoutRect(node: node, x: x, y: y, w: w, h: h,
+                         depth: depth, tag: cls, label: txt & "|" & cls)
+    let count = r.childCount(node)
+    if count == 0: return
+    let headerBand = min(12, max(0, h div 4))
+    let bodyY = y + headerBand
+    let bodyH = h - headerBand
+    if bodyH <= 0: return
+    let perChild = max(1, bodyH div count)
+    var cy = bodyY
+    for i in 0 ..< count:
+      let child = r.nthChild(node, i)
+      if child == 0: continue
+      let ch =
+        if i == count - 1: bodyY + bodyH - cy
+        else: perChild
+      walkLayout(r, child, x + 4, cy, w - 8, ch, rects, depth + 1, maxDepth)
+      cy += ch
+
+  proc buildLayoutRects*(r: AndroidRenderer; root: AndroidElement;
+                         width, height: int): seq[LayoutRect] =
+    ## Public layout pass.
+    result = @[]
+    if root == 0 or width <= 0 or height <= 0: return
+    walkLayout(r, root, 0, 0, width, height, result)
 
   proc renderFrame*(src: AndroidFrameSource): Frame =
     ## Capture the rendered Android view tree rooted at `src.root`
@@ -339,9 +432,13 @@ when defined(android) or defined(mockJni):
                      width: w, height: h, pixels: pixels)
     else:
       # `-d:mockJni` lane (host-side tests): no Android Runtime to
-      # drive `View.draw(Canvas)` against. Ship a placeholder frame
-      # matching the Linux-scaffold pixel pattern so the codec
-      # invariants still hold.
+      # drive `View.draw(Canvas)` against. Paint a synthetic raster
+      # that mirrors GPUI / Freya / Cocoa's ``ElementKindAttr`` -> tint
+      # binding (EMC2-M2) so host-side tests can exercise the matrix's
+      # fingerprint-ROI contract without booting an emulator. Pre-
+      # EMC2-M2 this branch shipped a uniform-grey frame regardless of
+      # the tree, which made the matrix's click-response measurement
+      # read ``null`` for every Android cell.
       var pixels = newSeq[byte](w * h * 4)
       for i in 0 ..< (w * h):
         let off = i * 4
@@ -349,6 +446,15 @@ when defined(android) or defined(mockJni):
         pixels[off + 1] = 0x18'u8
         pixels[off + 2] = 0x18'u8
         pixels[off + 3] = 0xFF'u8
+      if src.root != 0 and w > 0 and h > 0:
+        let r = AndroidRenderer()
+        let layoutRects = buildLayoutRects(r, src.root, w, h)
+        for lr in layoutRects:
+          let kindOverride = colourForKind(
+            r.getAttribute(lr.node, ElementKindAttr))
+          if not kindOverride.applied: continue
+          fillRect(pixels, w, h, lr.x, lr.y, lr.w, lr.h,
+                   kindOverride.r, kindOverride.g, kindOverride.b)
       result = Frame(kind: fkFull,
                      flags: FrameFlags(isDiff: false, isVideo: false),
                      width: w, height: h, pixels: pixels)
@@ -445,51 +551,7 @@ proc toAny*(src: AndroidFrameSource): AnyFrameSource =
 ## (`editor/backends/android.nim`) provides `-d:mockJni` at build
 ## time; tests `nim c --define:mockJni`.
 
-type
-  LayoutRect* = object
-    ## Per-node layout entry. Mirror of the GPUI / Freya / Cocoa
-    ## adapter's ``LayoutRect`` shape.
-    node*: AndroidElement
-    x*, y*, w*, h*: int
-    depth*: int
-    tag*, label*: string
-
 when defined(android) or defined(mockJni):
-
-  proc walkLayout(r: AndroidRenderer; node: AndroidElement;
-                  x, y, w, h: int;
-                  rects: var seq[LayoutRect]; depth = 0;
-                  maxDepth = 8) =
-    ## DFS that produces one ``LayoutRect`` per visited element.
-    if node == 0 or w <= 0 or h <= 0: return
-    if depth > maxDepth: return
-    let cls = r.getAttribute(node, "class")
-    let txt = r.textContent(node)
-    rects.add LayoutRect(node: node, x: x, y: y, w: w, h: h,
-                         depth: depth, tag: cls, label: txt & "|" & cls)
-    let count = r.childCount(node)
-    if count == 0: return
-    let headerBand = min(12, max(0, h div 4))
-    let bodyY = y + headerBand
-    let bodyH = h - headerBand
-    if bodyH <= 0: return
-    let perChild = max(1, bodyH div count)
-    var cy = bodyY
-    for i in 0 ..< count:
-      let child = r.nthChild(node, i)
-      if child == 0: continue
-      let ch =
-        if i == count - 1: bodyY + bodyH - cy
-        else: perChild
-      walkLayout(r, child, x + 4, cy, w - 8, ch, rects, depth + 1, maxDepth)
-      cy += ch
-
-  proc buildLayoutRects*(r: AndroidRenderer; root: AndroidElement;
-                         width, height: int): seq[LayoutRect] =
-    ## Public layout pass.
-    result = @[]
-    if root == 0 or width <= 0 or height <= 0: return
-    walkLayout(r, root, 0, 0, width, height, result)
 
   proc hitTestPath*(r: AndroidRenderer; root: AndroidElement;
                     width, height: int;
