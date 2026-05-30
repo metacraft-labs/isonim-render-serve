@@ -50,10 +50,20 @@
 ##   transport (multiple VP8L chunks in a WEBPAnimChunk) that would
 ##   set the bit to 0 to signal "decode through
 ##   ``createImageBitmap`` with multi-frame semantics".
-## * bit 1 (0x02): reserved, MUST be zero. The ELT-M9 follow-up will
-##   likely use this bit for the diff-region WebP variant (W-packet
-##   carrying multiple small rect-encoded VP8L blobs concatenated in
-##   the payload, each preceded by a rect header).
+## * bit 1 (0x02): ``isDiffRegion`` — ELT-M9. When set, the payload
+##   is NOT a single VP8L RIFF; instead it carries a length-prefixed
+##   sequence of rectangle-encoded RIFFs, each preceded by its
+##   (x, y, w, h) header (see ``encodeWDiffPacket`` below). The
+##   ``(width, height)`` fields in the W header still report the
+##   full-frame canvas dimensions so the browser side can call
+##   ``ensureSize`` exactly once per packet. Browser-side handlers
+##   branch on this bit: ``= 0`` → ELT-M8 single-RIFF path,
+##   ``= 1`` → walk rect list, ``createImageBitmap`` per rect,
+##   ``ctx.drawImage(bitmap, rx, ry)`` at the rect's coordinates.
+##   This mirrors the classical VNC-Tight architecture (a small
+##   patch list per tick instead of a full screen redraw) and
+##   delivers the bandwidth win the synthesis report's ``RS-M3``
+##   pointer recommended.
 ## * bits 2..7: reserved, MUST be zero.
 ##
 ## Note: the W packet kind shares no flag bits with F / V intentionally.
@@ -79,13 +89,34 @@ import ./packet  # PacketProtocolError + putU32LE / readU32LE helpers
 
 type
   WebpFlags* = object
-    isStillFrame*: bool  ## bit 0; ELT-M8 always sets this to true
+    isStillFrame*: bool   ## bit 0; ELT-M8 always sets this to true
+    isDiffRegion*: bool   ## bit 1; ELT-M9 — payload is a length-
+                          ## prefixed rect list instead of a single RIFF
 
   WebpFrame* = object
     flags*: WebpFlags
     codecId*: string       ## e.g. "image/webp"; max 255 UTF-8 bytes
     width*, height*: int
     riffBytes*: seq[byte]  ## raw WebP RIFF container (VP8L chunk)
+
+  WebpDiffRegion* = object
+    ## One rectangle in an ELT-M9 W-diff packet payload. ``riffBytes``
+    ## is a complete WebP RIFF container carrying the rectangle's
+    ## RGBA pixels — the browser-side decoder reconstructs the
+    ## rectangle via ``createImageBitmap`` then ``drawImage`` at
+    ## ``(x, y)``.
+    x*, y*, w*, h*: int
+    riffBytes*: seq[byte]
+
+  WebpDiffFrame* = object
+    ## ELT-M9 W-diff packet. ``width`` / ``height`` are full-frame
+    ## canvas dimensions (the browser uses them for ``ensureSize``);
+    ## ``regions`` is the diff list. ``codecId`` advertises the MIME
+    ## the browser side hands to ``createImageBitmap(Blob)`` for
+    ## every per-rect RIFF.
+    codecId*: string
+    width*, height*: int
+    regions*: seq[WebpDiffRegion]
 
 # ---------------------------------------------------------------------------
 # Little-endian helpers — local copies so this module compiles standalone
@@ -112,12 +143,16 @@ proc readU32LEw(buf: openArray[byte]; off: int): uint32 {.inline.} =
 proc encodeWebpFlags*(flags: WebpFlags): uint8 =
   result = 0
   if flags.isStillFrame: result = result or 0x01'u8
+  if flags.isDiffRegion: result = result or 0x02'u8
 
 proc decodeWebpFlags*(b: uint8): WebpFlags =
-  if (b and 0xFE'u8) != 0:
+  # ELT-M9: bit 1 (``isDiffRegion``) is now valid; the still-reserved
+  # bits are 2..7 (mask 0xFC).
+  if (b and 0xFC'u8) != 0:
     raise newException(PacketProtocolError,
       "W flag byte has non-zero reserved bits: " & $b)
   result.isStillFrame = (b and 0x01'u8) != 0
+  result.isDiffRegion = (b and 0x02'u8) != 0
 
 proc encodeWebpFrame*(w: WebpFrame): seq[byte] =
   ## Encode a W packet per the wire format documented in the module
@@ -195,3 +230,158 @@ const
     ## expects. ELT-M8 always emits this value; future profiles (e.g.
     ## ``image/webp2``) would supply their own codec_id while reusing
     ## the W packet tag.
+
+# ---------------------------------------------------------------------------
+# ELT-M9: diff-region variant — VNC-Tight-style per-rect VP8L payloads
+# ---------------------------------------------------------------------------
+##
+## When ``WebpFlags.isDiffRegion`` is set, the W packet's body is NOT a
+## single RIFF; it is a length-prefixed sequence of rectangle records.
+## The wire layout for the body is:
+##
+## .. code-block:: text
+##
+##     u32 LE rect_count
+##     rect_count × {
+##       u32 LE x,
+##       u32 LE y,
+##       u32 LE w,
+##       u32 LE h,
+##       u32 LE riff_length,
+##       riff_length bytes of WebP RIFF (VP8L body for this rect)
+##     }
+##
+## The W header's ``width`` / ``height`` fields stay the full-frame
+## canvas dimensions — the browser uses them to ``ensureSize`` once
+## per packet; the per-rect coordinates are local to that canvas.
+##
+## ``rect_count == 0`` is a legal heartbeat — the browser side renders
+## nothing (the previous frame remains on the canvas) but the editor
+## still ticks its activity signal. This is the "static UI" win the
+## architecture buys: a no-change frame ships as ``15 + codec_id_len
+## + 4`` bytes total (header + the leading rect_count u32).
+
+proc encodeWDiffPacket*(regions: openArray[WebpDiffRegion];
+                        fullW, fullH: int;
+                        codecId: string = DefaultWebPCodecId): seq[byte] =
+  ## Encode a W-diff packet from a list of WebP-encoded rectangles
+  ## plus the full-frame dimensions. Raises ``PacketProtocolError`` on
+  ## shape violations (codec_id > 255 bytes; non-positive dims;
+  ## rectangle with empty or sub-12-byte RIFF; rectangle running
+  ## outside the full-frame box). The browser-side handler relies on
+  ## these invariants when computing per-rect ``drawImage`` offsets.
+  if codecId.len > 255:
+    raise newException(PacketProtocolError,
+      "W codec_id length " & $codecId.len & " exceeds u8 max (255)")
+  if fullW <= 0 or fullH <= 0:
+    raise newException(PacketProtocolError,
+      "W diff full dimensions must be positive; got " &
+      $fullW & "x" & $fullH)
+  # Build the body first so we know its length for the W header.
+  var body = newSeqOfCap[byte](4 + regions.len * (20 + 64))
+  putU32LEw(body, uint32(regions.len))
+  for i, r in regions:
+    if r.w <= 0 or r.h <= 0:
+      raise newException(PacketProtocolError,
+        "W diff rect " & $i & " has non-positive dims " &
+        $r.w & "x" & $r.h)
+    if r.x < 0 or r.y < 0 or r.x + r.w > fullW or r.y + r.h > fullH:
+      raise newException(PacketProtocolError,
+        "W diff rect " & $i & " out of bounds: " &
+        $r.x & "," & $r.y & " " & $r.w & "x" & $r.h &
+        " (full " & $fullW & "x" & $fullH & ")")
+    if r.riffBytes.len < 12:
+      raise newException(PacketProtocolError,
+        "W diff rect " & $i & " riffBytes too short (need >= 12); got " &
+        $r.riffBytes.len)
+    putU32LEw(body, uint32(r.x))
+    putU32LEw(body, uint32(r.y))
+    putU32LEw(body, uint32(r.w))
+    putU32LEw(body, uint32(r.h))
+    putU32LEw(body, uint32(r.riffBytes.len))
+    for b in r.riffBytes: body.add b
+  # Wrap the body in the standard W header. The flag byte carries both
+  # ``isStillFrame`` (bit 0; still set for VNC-Tight per-rect tiles)
+  # AND ``isDiffRegion`` (bit 1; the variant marker).
+  let flagByte = encodeWebpFlags(
+    WebpFlags(isStillFrame: true, isDiffRegion: true))
+  let headerBase = 15 + codecId.len
+  result = newSeqOfCap[byte](headerBase + body.len)
+  result.add byte('W')
+  result.add flagByte
+  result.add byte(codecId.len)
+  for ch in codecId: result.add byte(ch)
+  putU32LEw(result, uint32(fullW))
+  putU32LEw(result, uint32(fullH))
+  putU32LEw(result, uint32(body.len))
+  for b in body: result.add b
+
+proc decodeWDiffPacket*(bytes: openArray[byte]): WebpDiffFrame =
+  ## Decode a W-diff packet. Raises ``PacketProtocolError`` on any
+  ## wire violation (wrong tag, ``isDiffRegion`` flag not set,
+  ## truncated header, mismatched body length, rect count payloads
+  ## that overrun the body slice).
+  if bytes.len < 3:
+    raise newException(PacketProtocolError,
+      "W-diff packet truncated; need >= 3 bytes, got " & $bytes.len)
+  if bytes[0] != byte('W'):
+    raise newException(PacketProtocolError,
+      "expected tag 'W' (0x57), got 0x" & toHex(int(bytes[0]), 2))
+  let flags = decodeWebpFlags(bytes[1])
+  if not flags.isDiffRegion:
+    raise newException(PacketProtocolError,
+      "W-diff decoder called on non-diff W packet (bit 1 unset)")
+  let codecLen = int(bytes[2])
+  let headerEnd = 3 + codecLen + 12
+  if bytes.len < headerEnd:
+    raise newException(PacketProtocolError,
+      "W-diff packet truncated; need >= " & $headerEnd &
+      " bytes for header, got " & $bytes.len)
+  var codecId = newString(codecLen)
+  for i in 0 ..< codecLen: codecId[i] = char(bytes[3 + i])
+  let widthOff = 3 + codecLen
+  let fullW = int(readU32LEw(bytes, widthOff))
+  let fullH = int(readU32LEw(bytes, widthOff + 4))
+  let bodyLen = int(readU32LEw(bytes, widthOff + 8))
+  if bytes.len - headerEnd != bodyLen:
+    raise newException(PacketProtocolError,
+      "W-diff body length mismatch: header says " & $bodyLen &
+      ", buffer has " & $(bytes.len - headerEnd))
+  if bodyLen < 4:
+    raise newException(PacketProtocolError,
+      "W-diff body too short for rect_count u32; got " & $bodyLen)
+  let count = int(readU32LEw(bytes, headerEnd))
+  var off = headerEnd + 4
+  var regions = newSeqOfCap[WebpDiffRegion](count)
+  for i in 0 ..< count:
+    if off + 20 > bytes.len:
+      raise newException(PacketProtocolError,
+        "W-diff rect header " & $i & " truncated")
+    let rx = int(readU32LEw(bytes, off))
+    let ry = int(readU32LEw(bytes, off + 4))
+    let rw = int(readU32LEw(bytes, off + 8))
+    let rh = int(readU32LEw(bytes, off + 12))
+    let rl = int(readU32LEw(bytes, off + 16))
+    off += 20
+    if off + rl > bytes.len:
+      raise newException(PacketProtocolError,
+        "W-diff rect " & $i & " payload truncated " &
+        "(off=" & $off & " rl=" & $rl & " buf=" & $bytes.len & ")")
+    var riff = newSeq[byte](rl)
+    for j in 0 ..< rl: riff[j] = bytes[off + j]
+    off += rl
+    regions.add WebpDiffRegion(
+      x: rx, y: ry, w: rw, h: rh, riffBytes: riff)
+  if off != bytes.len:
+    raise newException(PacketProtocolError,
+      "W-diff trailing bytes after rect list: " &
+      $(bytes.len - off))
+  result = WebpDiffFrame(
+    codecId: codecId, width: fullW, height: fullH, regions: regions)
+
+proc peekIsWebpDiffPacket*(bytes: openArray[byte]): bool {.inline.} =
+  ## Cheap dispatcher probe: returns true if the buffer is a W packet
+  ## with the ``isDiffRegion`` flag bit set. Mirrors
+  ## ``peekIsWebpPacket`` plus a single bit check.
+  bytes.len >= 2 and bytes[0] == byte('W') and
+    (uint8(bytes[1]) and 0x02'u8) != 0'u8

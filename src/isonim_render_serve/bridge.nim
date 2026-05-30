@@ -149,14 +149,25 @@ type
     ##
     ## * ``tsFirstFrame`` — always emit F (raw RGBA) so the browser
     ##   canvas seeds without any codec configure delay.
-    ## * ``tsWebP`` — frame change-score below threshold (static UI);
-    ##   the W path's lossless contract + sub-baseline bandwidth wins.
+    ## * ``tsWebP`` — full-frame WebP path (ELT-M8). Used for the
+    ##   first WebP-eligible frame on a connection (no cached prev
+    ##   frame to diff against) and any frame the selector flags as
+    ##   "too much change for the diff path" but still inside the
+    ##   static-UI threshold.
+    ## * ``tsWebPDiff`` — ELT-M9 diff-region WebP path. The selector
+    ##   computes ``computeDiffRegions(prev, curr)`` and emits a
+    ##   single W-diff packet whose payload is the per-rect VP8L
+    ##   list. Zero rectangles → header-only heartbeat. The "drag a
+    ##   window across the screen" 50%-coverage fallback the
+    ##   region encoder already returns is detected here and re-routed
+    ##   to the full-frame W path (or V if H.264 is up).
     ## * ``tsH264`` — frame change-score above threshold (animation,
     ##   scroll); the V path's per-frame sub-millisecond decode wins.
     ## * ``tsRawRgba`` — fallback when neither codec path is available
     ##   for this connection.
     tsFirstFrame
     tsWebP
+    tsWebPDiff
     tsH264
     tsRawRgba
 
@@ -334,6 +345,16 @@ type
       ## same coordinates and computes the L1 distance — cheap
       ## (1 KB worth of arithmetic) and proportional to the visible
       ## change. Empty until the first frame is captured.
+    prevWebpFullFrame: Option[Frame]
+      ## ELT-M9: per-connection snapshot of the last full RGBA frame
+      ## the W (or W-diff) path actually shipped, used as the prev
+      ## input to ``computeDiffRegions`` on the next tick. Distinct
+      ## from ``lastSentFrame`` (which is the F-packet diff cache so
+      ## the F path stays correct across ELT-M8's per-frame transport
+      ## flips); ELT-M9 needs its own snapshot because the W path
+      ## intentionally does NOT touch ``lastSentFrame`` (caching the
+      ## current frame there would corrupt the F-packet diff cache
+      ## if the selector flipped back to F next tick).
 
 proc manifestKey(m: ElementTreeManifest): string =
   ## Stable hash key over the (id, bounds) tuples of the manifest's
@@ -466,16 +487,20 @@ proc changeScore(prev, curr: seq[byte]): int =
 proc selectTransport(state: ConnectionState; curr: Frame;
                      cfg: BridgeConfig;
                      webpAvailable: bool): TransportSelection =
-  ## ELT-M8: per-frame transport selection. See the ``TransportSelection``
-  ## enum doc-comment for the policy.
+  ## ELT-M8 / ELT-M9: per-frame transport selection. See the
+  ## ``TransportSelection`` enum doc-comment for the policy.
+  ##
+  ## ELT-M9 extension: when the W path wins AND the connection has a
+  ## cached previous full-frame snapshot of identical dimensions, we
+  ## prefer the diff-region variant — only changed rectangles ship.
+  ## When the diff would cover >50% of the frame (the encoder's
+  ## fallback policy) or the dimensions changed since the last W
+  ## frame, we route back to the full-frame W path.
   if state.framesSent == 0:
     return tsFirstFrame
   if curr.kind != fkFull:
-    # Diff frames can only ship as F today — the W codec is image-
-    # complete-per-packet, not rect-based (ELT-M9 will land the
-    # rect-based variant on top of W). H.264 V packets are full-
-    # frame too. Either way we don't have a non-F transport for
-    # diff frames at ELT-M8.
+    # Diff frames the frame source produced directly can only ship
+    # as F — they're already rect-based but in the F-packet shape.
     return tsRawRgba
   let sample = captureFrameSample(curr)
   let score = changeScore(state.prevFrameSample, sample)
@@ -486,6 +511,15 @@ proc selectTransport(state: ConnectionState; curr: Frame;
   else:
     let webpOk = false
   if score < WebPChangeScoreThreshold and webpOk:
+    # ELT-M9: prefer the diff-region variant when we have a cached
+    # prev-frame snapshot of the same dimensions. The frame loop will
+    # call ``computeDiffRegions`` and downshift to ``tsWebP`` if the
+    # diff turns out to cover >50% of the frame (the encoder's
+    # full-frame fallback signal).
+    if state.prevWebpFullFrame.isSome:
+      let prev = state.prevWebpFullFrame.get
+      if prev.width == curr.width and prev.height == curr.height:
+        return tsWebPDiff
     tsWebP
   elif h264Ok:
     tsH264
@@ -666,9 +700,110 @@ proc frameLoop(client: AsyncSocket; cfg: BridgeConfig;
           except OSError, IOError:
             return
         state.lastSentFrame = none(Frame)
+        # ELT-M9: cache the current full frame so the next tick can
+        # diff against it.
+        if curr.kind == fkFull:
+          state.prevWebpFullFrame = some(curr)
+        else:
+          state.prevWebpFullFrame = none(Frame)
       else:
         # WebP compiled out. Selector should never produce this
         # branch, but be defensive: fall through to F.
+        try:
+          await sendBinary(client, encodeFrame(curr))
+        except OSError, IOError:
+          return
+        state.lastSentFrame = some(curr)
+    of tsWebPDiff:
+      when defined(withCodecWebP):
+        # ELT-M9: diff-region WebP. We re-use the RS-M3
+        # ``computeDiffRegions`` helper to identify changed rectangles
+        # against the per-connection prev-frame cache, then encode
+        # each region as its own VP8L RIFF and pack the list into a
+        # single W-diff packet (flag bit 1 set).
+        var fellBack = false
+        if state.webpEncoder == nil:
+          let cl =
+            if cfg.encoderWebpCompressionLevel > 0:
+              cfg.encoderWebpCompressionLevel
+            else: DefaultWebPCompressionLevel
+          state.webpEncoder = newWebPEncoderHandle(
+            curr.width, curr.height, compressionLevel = cl)
+        if state.webpEncoder != nil and
+           (state.webpEncoder.width != curr.width or
+            state.webpEncoder.height != curr.height):
+          state.webpEncoder = resize(state.webpEncoder,
+                                      curr.width, curr.height)
+        # selectTransport already verified the prev snapshot exists
+        # and matches dimensions; be defensive against races.
+        if state.prevWebpFullFrame.isNone or
+           state.webpEncoder == nil or
+           curr.kind != fkFull:
+          fellBack = true
+        else:
+          let prev = state.prevWebpFullFrame.get
+          let regions = computeDiffRegions(prev, curr)
+          if isFullFrameRegion(regions, curr.width, curr.height):
+            # >50% coverage. Fall back to the full-frame W path —
+            # encode the whole frame once and ship it as the
+            # ELT-M8 single-RIFF W packet.
+            try:
+              let w = encode(state.webpEncoder, curr.pixels)
+              await sendBinary(client, encodeWebpFrame(w))
+            except IOError, Defect:
+              fellBack = true
+          else:
+            # Encode each rectangle as its own RIFF. The rectangle's
+            # RGBA payload was extracted by ``computeDiffRegions``;
+            # we hand it through the WebP encoder via a transient
+            # rect-sized handle so the encoder's pixel-count check
+            # passes.
+            var emittedRegions = newSeqOfCap[WebpDiffRegion](regions.len)
+            var ok = true
+            for r in regions:
+              let rectEnc = newWebPEncoderHandle(
+                r.w, r.h,
+                compressionLevel = state.webpEncoder.compressionLevel)
+              if rectEnc == nil:
+                ok = false
+                break
+              try:
+                let wf = encode(rectEnc, r.pixels)
+                emittedRegions.add WebpDiffRegion(
+                  x: r.x, y: r.y, w: r.w, h: r.h,
+                  riffBytes: wf.riffBytes)
+              except IOError, Defect:
+                ok = false
+                break
+              finally:
+                destroy(rectEnc)
+            if ok:
+              try:
+                let packet = encodeWDiffPacket(
+                  emittedRegions, curr.width, curr.height,
+                  state.webpEncoder.codecId)
+                await sendBinary(client, packet)
+              except OSError, IOError:
+                return
+            else:
+              fellBack = true
+        if fellBack:
+          # Diff path failed mid-frame — degrade to F so the wire
+          # doesn't stall. Per ELT-M7's "no frame is ever dropped"
+          # guarantee.
+          try:
+            await sendBinary(client, encodeFrame(curr))
+          except OSError, IOError:
+            return
+        state.lastSentFrame = none(Frame)
+        if curr.kind == fkFull:
+          state.prevWebpFullFrame = some(curr)
+        else:
+          state.prevWebpFullFrame = none(Frame)
+      else:
+        # WebP compiled out. Selector should never produce this
+        # branch (the gate is per-frame inside selectTransport), but
+        # stay defensive: fall through to F.
         try:
           await sendBinary(client, encodeFrame(curr))
         except OSError, IOError:
@@ -768,7 +903,8 @@ proc bridgeOnce(client: AsyncSocket; cfg: BridgeConfig) {.async.} =
                               elementTreeKey: "",
                               h264Encoder: cfg.encoderHandle,
                               framesSent: 0,
-                              prevFrameSample: @[])
+                              prevFrameSample: @[],
+                              prevWebpFullFrame: none(Frame))
   await sendHello(client, cfg, state)
   # RS-M11: the manifest MUST land before the first F packet so the
   # editor's canvas can hit-test the very first pixel-rendered frame.

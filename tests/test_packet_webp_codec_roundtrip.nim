@@ -95,8 +95,9 @@ suite "ELT-M8: W codec":
       width: 16, height: 16,
       riffBytes: riffStub())
     var enc = encodeWebpFrame(w)
-    # Poison reserved bits.
-    enc[1] = enc[1] or 0x02'u8
+    # Poison reserved bits (bit 1 is now ``isDiffRegion`` per ELT-M9
+    # so we set bit 2 — still reserved at protocolVersion=1).
+    enc[1] = enc[1] or 0x04'u8
     expect PacketProtocolError:
       discard decodeWebpFrame(enc)
 
