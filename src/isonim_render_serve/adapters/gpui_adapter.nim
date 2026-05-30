@@ -53,6 +53,14 @@ import ../frame_source
 import ../packet
 import ../element_tree_attrs
 
+# EMC-M2 Option B: ``newSeqUninit[byte]`` skips the zero-init pass that
+# dominates the EMC-M1-audited 2.0-2.7 ms ``newSeq[byte]`` cost on the
+# headless readback path. The shim's ``copyMem`` fills the whole buffer
+# immediately afterwards, so zero-init is wasted work. ``stew/shims``
+# provides the compat shim for Nim versions that ship the proc under a
+# different name.
+import stew/shims/sequninit
+
 type
   GpuiFrameSource* = ref object
     renderer*: GpuiRenderer
@@ -293,7 +301,16 @@ proc renderHeadlessFrame(src: GpuiFrameSource): Frame =
                  width: w, height: h, pixels: @[])
   defer:
     gpui_bindings.gpui_free_pixels(outPtr, outLen)
-  var pixels = newSeq[byte](int(outLen))
+  # EMC-M2 Option B (per ``Editor-Matrix-Closer.milestones.org``):
+  # ``newSeqUninit[byte]`` skips the zero-init pass that the EMC-M1
+  # audit measured at ~2.0-2.7 ms median (the bulk of the per-frame
+  # "Nim alloc + copy" cost). The shim's ``copyMem`` writes every
+  # byte immediately after, so the zero-init was always dead work.
+  # The copy itself stays — the shim owns the returned buffer until
+  # ``gpui_free_pixels`` runs, and the frame consumer caches the
+  # full RGBA seq for the next-tick diff so we cannot hand the
+  # shim pointer out directly.
+  var pixels = newSeqUninit[byte](int(outLen))
   if pixels.len > 0:
     copyMem(addr pixels[0], outPtr, int(outLen))
   Frame(kind: fkFull,
