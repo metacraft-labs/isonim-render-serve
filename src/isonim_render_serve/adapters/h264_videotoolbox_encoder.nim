@@ -16,6 +16,8 @@
 ## still ``import`` the symbol and unconditionally see "unavailable".
 
 import std/os
+when not defined(js):
+  import std/dynlib
 
 import ../packet_video
 
@@ -97,13 +99,31 @@ proc selectEncoderKind*(prefer: EncoderKind = ekH264): EncoderKind =
       # an import would pull the adapter in unconditionally). The
       # WebP host probe is intentionally a duplicate of
       # ``webp_lossless_encoder.isWebPEncoderAvailable``; both check
-      # for an ffmpeg binary on the PATH (or ``$ISONIM_FFMPEG``).
+      # for either the FUH-M5 in-process libwebp dynlib OR an ffmpeg
+      # binary on the PATH (or ``$ISONIM_FFMPEG``).
       # The JS target never runs the bridge directly (the editor's
       # JS bundle is the browser-side decoder), so the probe is
       # native-only.
-      let env = getEnv("ISONIM_FFMPEG")
-      let bin = if env.len > 0: env else: findExe("ffmpeg")
-      if bin.len > 0: ekWebP
+      var hasBackend = false
+      when defined(withInProcessWebP):
+        # Lazy probe — if the dynlib loads, the in-process path is
+        # live and ffmpeg presence is irrelevant. Mirrors the
+        # ``isLibwebpAvailable`` shape in ``webp_libwebp_ffi``;
+        # we can't import that module here without dragging the
+        # FFI into every encoder selector, so we re-probe via
+        # ``loadLib``.
+        let probeLib = dynlib.loadLib(
+          when defined(macosx): "libwebp.dylib"
+          elif defined(linux): "libwebp.so.7"
+          else: "libwebp")
+        if probeLib != nil:
+          dynlib.unloadLib(probeLib)
+          hasBackend = true
+      if not hasBackend:
+        let env = getEnv("ISONIM_FFMPEG")
+        let bin = if env.len > 0: env else: findExe("ffmpeg")
+        if bin.len > 0: hasBackend = true
+      if hasBackend: ekWebP
       elif isHardwareEncoderAvailable(): ekH264
       else: ekRawRgba
     else:

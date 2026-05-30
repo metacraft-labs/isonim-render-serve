@@ -49,23 +49,37 @@ import std/[os, osproc, streams]
 
 import ../packet_webp
 
+when defined(withInProcessWebP):
+  ## FUH-M5: the in-process libwebp FFI. Gated by the build define
+  ## so a launcher binary that doesn't link libwebp (or runs on a
+  ## host without it) can still compile the encoder facade — the
+  ## subprocess path stays available and the runtime probe will
+  ## fall through to it.
+  import ./webp_libwebp_ffi
+
 type
   WebPEncoderKind* = enum
     ## Internal — which backend the facade dispatches to. ELT-M8
-    ## ships ``wekFfmpegSubprocess`` only; a future ``wekLibwebpDirect``
-    ## variant would land alongside it as soon as a Nim wrapper for
-    ## the libwebp C API exists in the workspace.
+    ## shipped ``wekFfmpegSubprocess`` only; FUH-M5 adds
+    ## ``wekLibwebpDirect`` for the in-process FFI path. The
+    ## constructor picks the variant based on the build-time
+    ## ``-d:withInProcessWebP`` flag + the runtime ``isLibwebpAvailable``
+    ## probe; callers can introspect ``handle.kind`` (or just
+    ## ``handle.inProcess``) to confirm which path is live.
     wekFfmpegSubprocess
+    wekLibwebpDirect
 
   WebPEncoderHandle* = ref object
     ## Opaque handle. Width / height are cached so resize is a
-    ## constant-time field swap; the subprocess-based backend has no
-    ## per-session state to tear down (each encode is independent).
+    ## constant-time field swap; both backends are stateless across
+    ## frames (FUH-M4 audit § 3.2) so no per-session resources need
+    ## tearing down.
     width*, height*: int
-    compressionLevel*: int    ## libwebp `-compression_level` (1-6); 3 is the ELT-M7 recommendation.
-    quality*: int             ## libwebp `-quality` (only used to silence the encoder; lossless mode dominates).
+    compressionLevel*: int    ## libwebp ``method`` (1-6); 3 is the ELT-M7 recommendation.
+    quality*: int             ## libwebp ``-quality`` (only used to silence the encoder; lossless mode dominates).
     codecId*: string          ## Goes into the W-packet header; defaults to ``DefaultWebPCodecId``.
     kind*: WebPEncoderKind
+    inProcess*: bool          ## Mirrors ``kind == wekLibwebpDirect``; surfaced for tests + the FUH-M6 bench.
     ffmpegBin: string         ## Resolved at construction so callers can override via ``$ISONIM_FFMPEG``.
 
 const
@@ -93,12 +107,25 @@ proc resolveFfmpegBin*(): string =
   ""
 
 proc isWebPEncoderAvailable*(): bool =
-  ## Probe — does this host have an ffmpeg binary linked against
-  ## libwebp lossless? We don't run a full encode here; the binary's
-  ## presence is the cheap proxy. Worst-case false positives surface
-  ## at the first encode as a non-zero exit code which the launcher
-  ## reports + degrades from.
+  ## Probe — does this host have an encoder backend reachable? Either
+  ## the in-process libwebp FFI (when built with
+  ## ``-d:withInProcessWebP``) or an ffmpeg binary. The probe returns
+  ## true if EITHER is usable; callers that need to distinguish use
+  ## ``isInProcessWebPEncoderAvailable`` below.
+  when defined(withInProcessWebP):
+    if isLibwebpAvailable():
+      return true
   resolveFfmpegBin().len > 0
+
+proc isInProcessWebPEncoderAvailable*(): bool =
+  ## FUH-M5: returns true only when the in-process libwebp FFI is
+  ## reachable. Distinct from ``isWebPEncoderAvailable`` (which is
+  ## true for either backend) so the budget test can fail-loud when
+  ## the in-process path isn't actually live.
+  when defined(withInProcessWebP):
+    isLibwebpAvailable()
+  else:
+    false
 
 # ---------------------------------------------------------------------------
 # Handle lifecycle
@@ -109,8 +136,20 @@ proc newWebPEncoderHandle*(width, height: int;
                             quality = DefaultWebPQuality;
                             codecId = ""): WebPEncoderHandle =
   ## Build a handle for the given dimensions. Returns nil when the
-  ## host has no ffmpeg binary — callers MUST treat nil as "fall back
-  ## to F-packet path" and not attempt to encode.
+  ## host has neither an in-process libwebp FFI (FUH-M5) nor an
+  ## ffmpeg binary; callers MUST treat nil as "fall back to F-packet
+  ## path" and not attempt to encode.
+  ##
+  ## FUH-M5 backend selection:
+  ##
+  ## 1. If built with ``-d:withInProcessWebP`` AND
+  ##    ``isLibwebpAvailable()`` returns true, prefer the in-process
+  ##    path. The ``ffmpegBin`` field stays populated when available
+  ##    so the launcher can fall back per-call if libwebp returns an
+  ##    error mid-session.
+  ## 2. Otherwise fall back to the existing subprocess path
+  ##    (unchanged behavior; backward-compat critical — the
+  ##    subprocess fallback must produce byte-identical wire output).
   ##
   ## ``compressionLevel`` is clamped to libwebp's documented [1, 6]
   ## range. ``quality`` is clamped to [0, 100]. ``codecId`` defaults
@@ -119,7 +158,12 @@ proc newWebPEncoderHandle*(width, height: int;
   ## can advertise its own MIME without rebuilding the facade.
   if width <= 0 or height <= 0: return nil
   let bin = resolveFfmpegBin()
-  if bin.len == 0: return nil
+  var inProcessSelected = false
+  when defined(withInProcessWebP):
+    if isLibwebpAvailable():
+      inProcessSelected = true
+  # When the in-process path isn't available, we still require ffmpeg.
+  if not inProcessSelected and bin.len == 0: return nil
   var clampedCL = compressionLevel
   if clampedCL < 1: clampedCL = 1
   if clampedCL > 6: clampedCL = 6
@@ -128,12 +172,15 @@ proc newWebPEncoderHandle*(width, height: int;
   if clampedQ > 100: clampedQ = 100
   let resolvedCodecId =
     if codecId.len > 0: codecId else: DefaultWebPCodecId
+  let chosenKind =
+    if inProcessSelected: wekLibwebpDirect else: wekFfmpegSubprocess
   WebPEncoderHandle(
     width: width, height: height,
     compressionLevel: clampedCL,
     quality: clampedQ,
     codecId: resolvedCodecId,
-    kind: wekFfmpegSubprocess,
+    kind: chosenKind,
+    inProcess: inProcessSelected,
     ffmpegBin: bin)
 
 proc destroy*(enc: WebPEncoderHandle) =
@@ -216,16 +263,32 @@ proc encodeViaFfmpeg(enc: WebPEncoderHandle;
       " (rgba=" & $rgba.len & " bytes, " & $enc.width & "x" & $enc.height & ")")
   collected
 
+when defined(withInProcessWebP):
+  proc encodeViaLibwebp(enc: WebPEncoderHandle;
+                        rgba: openArray[byte]): seq[byte] =
+    ## FUH-M5: in-process encode through the libwebp FFI. Allocates
+    ## a fresh ``WebPConfig`` + ``WebPPicture`` per call (stateless —
+    ## see FUH-M4 audit § 3.2) and returns the same VP8L RIFF bytes
+    ## the subprocess path produces. ``LibwebpEncodeError`` /
+    ## ``IOError`` propagate to the caller; the encode dispatch
+    ## below catches the former and falls back to ffmpeg so a
+    ## launcher-time libwebp error doesn't crash the bridge.
+    encodeWebPLossless(rgba, enc.width, enc.height, enc.compressionLevel)
+
 proc encode*(enc: WebPEncoderHandle;
              rgba: openArray[byte]): WebpFrame =
   ## Encode one RGBA frame into a ``WebpFrame`` ready for the W
   ## packet codec. The launcher's render loop hands the result to
   ## ``encodeWebpFrame`` in ``packet_webp.nim``.
   ##
-  ## Raises ``Defect`` when the handle is nil; ``IOError`` when
-  ## ffmpeg fails (rare — the binary's presence was probed at handle
-  ## construction). The bridge treats either failure mode as "skip
-  ## the W path for this frame, fall back to F".
+  ## FUH-M5 dispatch: when ``enc.inProcess`` is true the encode goes
+  ## through the libwebp FFI; otherwise it goes through the existing
+  ## subprocess pipeline. Both paths produce a VP8L lossless RIFF;
+  ## the test suite verifies decoded-pixel parity.
+  ##
+  ## Raises ``Defect`` when the handle is nil; ``IOError`` on
+  ## subprocess or buffer-size failures. The bridge treats either
+  ## failure mode as "skip the W path for this frame, fall back to F".
   if enc == nil:
     raise newException(Defect,
       "WebPEncoderHandle is nil; launcher should have fallen back " &
@@ -236,7 +299,25 @@ proc encode*(enc: WebPEncoderHandle;
       "webp_lossless_encoder: rgba length " & $rgba.len &
       " != width*height*4 = " & $expected &
       " (" & $enc.width & "x" & $enc.height & ")")
-  let riff = encodeViaFfmpeg(enc, rgba)
+  var riff: seq[byte]
+  when defined(withInProcessWebP):
+    if enc.inProcess:
+      try:
+        riff = encodeViaLibwebp(enc, rgba)
+      except LibwebpEncodeError:
+        # Defensive fallback — libwebp returned an error mid-session.
+        # If the launcher has an ffmpeg binary, use it; otherwise
+        # let the IOError propagate per the encoder contract.
+        if enc.ffmpegBin.len > 0:
+          riff = encodeViaFfmpeg(enc, rgba)
+        else:
+          raise newException(IOError,
+            "webp_lossless_encoder: in-process libwebp failed and " &
+            "no ffmpeg fallback available")
+    else:
+      riff = encodeViaFfmpeg(enc, rgba)
+  else:
+    riff = encodeViaFfmpeg(enc, rgba)
   result = WebpFrame(
     flags: WebpFlags(isStillFrame: true),
     codecId: enc.codecId,

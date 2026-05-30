@@ -91,3 +91,15 @@ switch("path", "$config/../nim-pty/src")
 # Linux scaffold build that doesn't ship ffmpeg) is a per-invocation
 # ``--define:withCodecWebP=false`` flag.
 switch("define", "withCodecWebP")
+
+# FUH-M5: in-process libwebp encoder. Default-on so every launcher
+# binary built through this repo (test suite, the standalone bridge
+# CLI, the per-backend launchers in ``isonim-examples``) prefers the
+# direct API call over the ~133 ms ffmpeg subprocess spawn that the
+# FUH-M4 audit measured. The runtime probe in
+# ``adapters/webp_libwebp_ffi.isLibwebpAvailable`` falls back to the
+# subprocess path when ``libwebp.dylib`` / ``libwebp.so.7`` can't be
+# loaded (e.g. minimal CI host without libwebp), so toggling this
+# off is rarely needed; the escape hatch is
+# ``--define:withInProcessWebP=false``.
+switch("define", "withInProcessWebP")

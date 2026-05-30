@@ -58,6 +58,18 @@
                 shellcheck
                 shfmt
                 nodejs_20
+                # FUH-M5: in-process libwebp encoder. The Nim FFI in
+                # ``adapters/webp_libwebp_ffi.nim`` loads
+                # ``libwebp.dylib`` (macOS) / ``libwebp.so.7`` (Linux)
+                # at runtime via ``{.dynlib.}``; the package's
+                # ``lib/`` directory must therefore be reachable via
+                # ``DYLD_FALLBACK_LIBRARY_PATH`` / ``LD_LIBRARY_PATH``,
+                # which ``mkShell`` populates automatically for any
+                # input that ships shared objects. Replaces the
+                # ~133 ms ffmpeg subprocess spawn (FUH-M4 § 5) with a
+                # direct API call under the 16 ms budget.
+                libwebp
+                pkg-config
               ]
               ++ pkgs.lib.optionals (pkgs.lib.hasSuffix "linux" system) [
                 # RS-M2: the GPUI streaming adapter (and the integration
@@ -69,10 +81,25 @@
                 # provide is the loader search path. We extend
                 # `LD_LIBRARY_PATH` in `shellHook` below.
                 tree-sitter
-                pkg-config
               ];
             shellHook = ''
               ${preCommit.shellHook}
+              # FUH-M5: macOS strips DYLD_* env vars from many child
+              # processes for SIP, but the dev shell itself can still
+              # set them so ``nim c -r`` and the Justfile launchers
+              # find ``libwebp.dylib`` without a global install. Nix's
+              # ``mkShell`` populates ``NIX_LDFLAGS`` but not the
+              # runtime loader path, so we extend it explicitly here.
+              ${
+                if pkgs.stdenv.isDarwin then
+                  ''
+                    export DYLD_FALLBACK_LIBRARY_PATH="${pkgs.libwebp}/lib''${DYLD_FALLBACK_LIBRARY_PATH:+:$DYLD_FALLBACK_LIBRARY_PATH}"
+                  ''
+                else
+                  ''
+                    export LD_LIBRARY_PATH="${pkgs.libwebp}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+                  ''
+              }
               # RS-M2: extend LD_LIBRARY_PATH so `nim c -r` driven tests
               # that import `isonim_gpui/renderer` find the shim cdylib.
               # The shim is built once via `cd ../isonim-gpui && just
