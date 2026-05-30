@@ -15,6 +15,8 @@
 ## This module exists so a Linux build of ``isonim-render-serve`` can
 ## still ``import`` the symbol and unconditionally see "unavailable".
 
+import std/os
+
 import ../packet_video
 
 when defined(macosx):
@@ -34,11 +36,22 @@ type
     ## ``ekRawRgba`` is the EPP-M4 (and prior) baseline — the bridge
     ## emits raw F packets with RGBA8888 payload. ``ekH264`` is the
     ## EPP-M5 path: emit V packets with hardware-encoded H.264 NALU
-    ## bytes. Future entries: ``ekJpeg`` (per-frame JPEG fallback),
-    ## ``ekVaapi`` / ``ekNvenc`` (Linux hardware encoders deferred to
-    ## a follow-up campaign).
+    ## bytes. ``ekWebP`` is the ELT-M8 path: emit W packets with
+    ## libwebp-lossless RIFF bytes, decoded browser-side via
+    ## ``createImageBitmap(Blob)`` (no WebCodecs). Per the campaign
+    ## brief's "dormant-code-on-loss" principle, ``ekWebP`` is the
+    ## SHIP tier from ELT-M7 and is compiled into the editor build
+    ## by default (``-d:withCodecWebP`` is on by default; turning it
+    ## off compiles ``ekWebP`` out as ``ekRawRgba``).
+    ##
+    ## Future entries: ``ekJpegXl`` (gated behind
+    ## ``-d:withCodecJpegXl``; dormant per ELT-M7), ``ekAv1Sct``
+    ## (gated behind ``-d:withCodecAv1Sct``; dormant per ELT-M7),
+    ## ``ekVaapi`` / ``ekNvenc`` (Linux hardware encoders deferred
+    ## to a follow-up campaign).
     ekRawRgba
     ekH264
+    ekWebP
 
   H264EncoderHandle* = ref object
     ## Polymorphic wrapper. On macOS ``handle`` holds the live
@@ -63,7 +76,12 @@ proc isHardwareEncoderAvailable*(): bool =
 proc selectEncoderKind*(prefer: EncoderKind = ekH264): EncoderKind =
   ## Resolve a per-launcher encoder preference against host
   ## capability. ``ekRawRgba`` always returns itself; ``ekH264``
-  ## degrades to ``ekRawRgba`` when the host can't produce H.264.
+  ## degrades to ``ekRawRgba`` when the host can't produce H.264;
+  ## ``ekWebP`` survives whenever the editor build was compiled with
+  ## ``-d:withCodecWebP`` (the default — ELT-M8 ships WebP as the
+  ## SHIP tier per ELT-M7 synthesis report) AND the host has an
+  ## ffmpeg binary linked against libwebp. Without either, ``ekWebP``
+  ## degrades to ``ekH264`` (if available) or ``ekRawRgba``.
   ##
   ## Called once at launcher boot. The result is pinned for the
   ## lifetime of the bridge connection so transient encoder failures
@@ -72,6 +90,28 @@ proc selectEncoderKind*(prefer: EncoderKind = ekH264): EncoderKind =
   of ekRawRgba: ekRawRgba
   of ekH264:
     if isHardwareEncoderAvailable(): ekH264 else: ekRawRgba
+  of ekWebP:
+    when defined(withCodecWebP) and not defined(js):
+      # Avoid an import cycle (the WebP adapter imports
+      # ``packet_webp``; routing through this enum's host probe via
+      # an import would pull the adapter in unconditionally). The
+      # WebP host probe is intentionally a duplicate of
+      # ``webp_lossless_encoder.isWebPEncoderAvailable``; both check
+      # for an ffmpeg binary on the PATH (or ``$ISONIM_FFMPEG``).
+      # The JS target never runs the bridge directly (the editor's
+      # JS bundle is the browser-side decoder), so the probe is
+      # native-only.
+      let env = getEnv("ISONIM_FFMPEG")
+      let bin = if env.len > 0: env else: findExe("ffmpeg")
+      if bin.len > 0: ekWebP
+      elif isHardwareEncoderAvailable(): ekH264
+      else: ekRawRgba
+    else:
+      # WebP compiled out (or JS target — the editor's browser bundle
+      # never runs ``selectEncoderKind`` at runtime; it consults the
+      # launcher's hello capability bag). Either way: behave as if
+      # the host had no libwebp.
+      if isHardwareEncoderAvailable(): ekH264 else: ekRawRgba
 
 proc encoderKindName*(k: EncoderKind): string =
   ## Wire-format identifier surfaced in the hello capability bag.
@@ -82,6 +122,7 @@ proc encoderKindName*(k: EncoderKind): string =
   case k
   of ekRawRgba: "raw_rgba"
   of ekH264:    "h264_videotoolbox"
+  of ekWebP:    "webp_lossless"
 
 proc newH264EncoderHandle*(width, height: int;
                            bitrate = 2_000_000;

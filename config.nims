@@ -81,3 +81,13 @@ switch("path", "$config/../isonim-examples")
 switch("path", "$config/../isonim-tui/src")
 switch("path", "$config/../nim-termctl/src")
 switch("path", "$config/../nim-pty/src")
+
+# ELT-M8: WebP-lossless production transport is the SHIP tier per the
+# ELT-M7 synthesis report. The codec adapter is gated behind
+# ``-d:withCodecWebP``; we default it ON at the config level so every
+# ``nim c`` invocation through this repo (tests, launcher composition
+# via ``isonim-examples``, the standalone bridge CLI) compiles the
+# W-packet path in unconditionally. Disabling (e.g. for a minimal
+# Linux scaffold build that doesn't ship ffmpeg) is a per-invocation
+# ``--define:withCodecWebP=false`` flag.
+switch("define", "withCodecWebP")

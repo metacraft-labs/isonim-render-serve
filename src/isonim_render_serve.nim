@@ -15,6 +15,7 @@
 
 import ./isonim_render_serve/packet
 import ./isonim_render_serve/packet_video
+import ./isonim_render_serve/packet_webp
 import ./isonim_render_serve/ws_frame
 import ./isonim_render_serve/event_dispatch
 import ./isonim_render_serve/frame_source
@@ -25,9 +26,29 @@ import ./isonim_render_serve/story_dispatch
 import ./isonim_render_serve/launcher_sinks
 import ./isonim_render_serve/adapters/h264_videotoolbox_encoder
 
-export packet, packet_video, ws_frame, event_dispatch, frame_source,
-       diff_region, stub_frame_source, element_tree_attrs,
-       story_dispatch, launcher_sinks, h264_videotoolbox_encoder
+export packet, packet_video, packet_webp, ws_frame, event_dispatch,
+       frame_source, diff_region, stub_frame_source,
+       element_tree_attrs, story_dispatch, launcher_sinks,
+       h264_videotoolbox_encoder
+
+# ELT-M8: gate the WebP encoder adapter behind the
+# ``-d:withCodecWebP`` define per the campaign brief's
+# "dormant-code-on-loss" principle. WebP is the SHIP tier so the
+# default for the editor's launcher build is ON. Setting
+# ``-d:withCodecWebP=false`` (or just not passing the define and
+# building with ``--define:noWebP``) drops the adapter from the
+# binary; ``EncoderKind`` still carries the ``ekWebP`` variant
+# (so the bridge's selector can degrade it gracefully) but no
+# encoder facade is reachable.
+#
+# The adapter uses ``std/osproc`` + ``std/streams`` for the ffmpeg
+# subprocess shell-out; both are native-only. The JS target (the
+# editor's browser bundle) never invokes the launcher-side encoder,
+# so we also gate on ``not defined(js)`` to keep the editor bundle
+# free of subprocess-spawning code paths it could never reach.
+when defined(withCodecWebP) and not defined(js):
+  import ./isonim_render_serve/adapters/webp_lossless_encoder
+  export webp_lossless_encoder
 
 # The `bridge` module pulls `asyncdispatch` / `asynchttpserver` /
 # `nativesockets` / `os` and other POSIX-only symbols. `nim js`
