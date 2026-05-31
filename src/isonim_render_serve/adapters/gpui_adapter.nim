@@ -443,6 +443,26 @@ proc renderHeadlessFrame(src: GpuiFrameSource): Frame =
       # the next tick polls it again.
       emitFrame = lastFrameOrSynthetic(src)
       haveFrameToEmit = true
+    elif rc == gpui_bindings.GpuiRenderTakeStale:
+      # ERV-M3: the in-flight render was submitted before a story-
+      # switch. The shim freed the (possibly already-rendered)
+      # bytes; the token is consumed. Do NOT re-emit the previous
+      # frame here — the cached ``lastFramePixels`` belong to the
+      # OLD story too. We submit a fresh render below (step 2)
+      # against the current tree; the bridge falls through to the
+      # synthetic raster for this tick (which paints the current
+      # tree topology) and the new headless bytes land on the
+      # next tick.
+      #
+      # NOTE: the previous-story cache is intentionally left in
+      # place. The synthetic-raster fallback in ``renderFrame``
+      # paints the *current* tree (via the shim's tree-inspection
+      # FFI), so it is up-to-date even before the next headless
+      # frame lands. The stale cache only re-surfaces if a future
+      # tick observes a Pending poll before the next Ready bytes
+      # arrive; that's a one-tick window which is preferable to a
+      # multi-tick wrong-story window.
+      src.pendingToken = 0'u32
     elif rc == gpui_bindings.GpuiRenderTakeUnknownToken:
       # Worker forgot the token (shouldn't happen, but be defensive).
       src.pendingToken = 0'u32
@@ -508,6 +528,19 @@ proc renderHeadlessFrame(src: GpuiFrameSource): Frame =
         break
       elif rc == gpui_bindings.GpuiRenderTakePending:
         # Busy-wait a few ms; this is the bootstrap path only.
+        sleep(pollIntervalMs)
+        elapsed += pollIntervalMs
+        continue
+      elif rc == gpui_bindings.GpuiRenderTakeStale:
+        # ERV-M3: a story-switch landed mid-bootstrap. Resubmit
+        # against the current tree; restart the wait window so
+        # the bootstrap still gets a real first frame instead of
+        # falling through to the synthetic raster.
+        src.pendingToken = gpui_bindings.gpui_render_submit_async(
+          cuint(w), cuint(h), cfloat(1.0))
+        if src.pendingToken == 0'u32:
+          src.asyncDisabled = true
+          return renderHeadlessFrameSync(src)
         sleep(pollIntervalMs)
         elapsed += pollIntervalMs
         continue
@@ -606,6 +639,54 @@ proc close*(src: GpuiFrameSource) =
   ## composition root that built the tree). The shim's tree is reset
   ## via `gpui_reset_tree()` by the demo when it tears down.
   discard
+
+# ---------------------------------------------------------------------------
+# ERV-M3: story-generation guard.
+# ---------------------------------------------------------------------------
+#
+# ``bumpStoryGeneration`` must be called by the launcher's
+# ``StoryDispatchSink`` ``mountFn`` BEFORE the shared GPUI shadow tree
+# mutates in response to a ``select-story`` event. Once bumped, any
+# render request that was submitted at the prior generation (i.e. in
+# flight on the shim's worker thread, holding the *old* story's tree
+# state) will be discarded by ``gpui_render_try_take`` instead of
+# being returned to the bridge. Without this call the worker's
+# pre-switch in-flight bytes win the race and the user sees the
+# previous story painted for one or more ticks before the new story
+# lands — the bug ERV-M3 fixes.
+#
+# Wiring template (launcher pseudo-code, mirrors
+# ``isonim-examples/editor/backends/gpui.nim``):
+#
+# .. code-block:: nim
+#
+#   let mountFn = proc(storyId: string; properties: JsonNode)
+#                 {.closure, gcsafe.} =
+#     # ERV-M3: bump BEFORE mutating the VM so the next render
+#     # observes the new generation and any in-flight frame against
+#     # the prior tree is dropped instead of painted.
+#     src.bumpStoryGeneration()
+#     applyTaskStory(captTaskVm, storyId)
+#
+# A single counter is shared across every ``GpuiFrameSource`` in
+# the process because the shim's render worker is a global. This is
+# consistent with the rest of the GPUI shim FFI (no per-handle
+# state); per-connection sharding can be added once the worker
+# moves off a global.
+#
+# Returns the new (post-bump) generation value for diagnostic
+# logging; callers MAY ignore it.
+
+proc bumpStoryGeneration*(src: GpuiFrameSource): uint64 {.discardable.} =
+  ## Bump the shim's process-wide render-generation counter.
+  ## See the module-level comment above for the wiring contract.
+  ##
+  ## ``src`` is unused today (the shim's worker is global), but the
+  ## proc takes it so the launcher can opt-in per-source if/when
+  ## the shim grows per-connection workers without breaking the
+  ## launcher's call site.
+  discard src
+  gpui_bindings.gpui_bump_generation()
 
 # ---------------------------------------------------------------------------
 # Constructors
