@@ -399,73 +399,6 @@ type
       ## intentionally does NOT touch ``lastSentFrame`` (caching the
       ## current frame there would corrupt the F-packet diff cache
       ## if the selector flipped back to F next tick).
-    inputEventPending: Future[void]
-      ## ECC-M2: per-connection eager-render signal. The frame loop
-      ## races ``sleepAsync(residueMs)`` against this future so an
-      ## input event landing during the post-tick sleep wakes the
-      ## loop immediately instead of paying up to ``frameIntervalMs``
-      ## of dead time before the next render. ``handleInbound``
-      ## completes the future on each input I-packet (mouse /
-      ## keyboard / key / scroll / focus); the frame loop swaps in
-      ## a fresh future after consuming a tick so subsequent events
-      ## arm the next wakeup. Multiple events that land inside a
-      ## single tick budget collapse onto the same future and
-      ## therefore produce ONE early tick — no oversaturation.
-    lastTickStartMs: int64
-      ## ECC-M2: monotonic-clock timestamp (ms) at the start of the
-      ## previous render tick. The frame loop enforces a 60 FPS cap
-      ## on eager-render wakeups by deferring the next tick until at
-      ## least ``MinTickIntervalMs`` (16 ms) have elapsed since this
-      ## stamp, regardless of how loudly inputEventPending signals.
-      ## Idle / non-eager ticks already respect ``frameIntervalMs``
-      ## via the residue sleep, so the cap only kicks in when an
-      ## eager wakeup races ahead of the 60 FPS floor.
-
-const
-  MinTickIntervalMs* = 16
-    ## ECC-M2: 60 FPS floor for eager-render wakeups. The bridge
-    ## NEVER ticks faster than ~62.5 FPS even under a pathological
-    ## input loop, so renderer CPU + per-frame encode cost stay
-    ## bounded. Independent of ``frameIntervalMs`` (which sets the
-    ## *idle* cadence): when ``frameIntervalMs > MinTickIntervalMs``
-    ## (the 30 FPS default), eager render can advance the next tick
-    ## by up to ``frameIntervalMs - MinTickIntervalMs``; when the
-    ## launcher already runs at 60 FPS or faster, eager render is a
-    ## no-op (the cap matches the cadence).
-
-proc signalInputEvent(state: ConnectionState) =
-  ## ECC-M2: flip the per-connection eager-render signal so the
-  ## frame loop's race wakes immediately. Two behaviours:
-  ##
-  ##   * If the current pending future is still un-completed (the
-  ##     frame loop hasn't consumed it yet), complete it. Subsequent
-  ##     calls inside the same tick budget collapse on the *same*
-  ##     finished future and become silent no-ops — that's the
-  ##     coalescing rule: N events inside a tick budget → ONE early
-  ##     tick.
-  ##   * If the future is nil or already finished (rare: the frame
-  ##     loop just consumed it and hasn't yet armed the next one),
-  ##     arm a fresh one and complete it immediately so the NEXT
-  ##     race-wait wakes on entry. This closes the consume-and-arm
-  ##     race that would otherwise drop a signal.
-  if state == nil: return
-  if state.inputEventPending == nil or state.inputEventPending.finished:
-    state.inputEventPending = newFuture[void]("bridge.inputEventPending")
-  state.inputEventPending.complete()
-
-proc isEagerInputEvent(ev: InputEvent): bool =
-  ## ECC-M2: gate the eager-render signal to event kinds that
-  ## plausibly mutate paint-visible VM state. ``iekResize`` is
-  ## intentionally excluded — the resize sink mutates frame source
-  ## dimensions and the next idle tick already picks them up
-  ## without needing to short-circuit the residue sleep.
-  ## ``iekSelectStory`` / ``iekApplyMutation`` are excluded for the
-  ## same reason: the launcher re-mounts a story or commits a
-  ## mutation off the main loop and the next tick captures the
-  ## result.
-  case ev.kind
-  of iekMouse, iekKeyboard, iekKey, iekScroll, iekFocus: true
-  of iekResize, iekSelectStory, iekApplyMutation: false
 
 proc manifestKey(m: ElementTreeManifest): string =
   ## Stable hash key over the (id, kind, bounds) tuples of the
@@ -752,7 +685,6 @@ proc frameLoop(client: AsyncSocket; cfg: BridgeConfig;
       await sleepAsync(5)
       continue
     let tickStart = getMonoTime()
-    state.lastTickStartMs = inMilliseconds(tickStart - MonoTime())
     # RS-M11: re-check the element-tree manifest each tick BEFORE
     # rendering the frame. If the (id, bounds) set has changed we
     # emit a fresh manifest; otherwise the cadence rule skips the
@@ -979,52 +911,7 @@ proc frameLoop(client: AsyncSocket; cfg: BridgeConfig;
     # request even when the render itself takes most of the cap.
     let elapsedMs = int(inMilliseconds(getMonoTime() - tickStart))
     let residueMs = cfg.frameIntervalMs - elapsedMs
-    # ECC-M2: race the residue sleep against the per-connection
-    # eager-render signal. An input event that lands at any point
-    # during the residue completes ``state.inputEventPending`` and
-    # the race wakes immediately — collapsing the 0..frameIntervalMs
-    # next-tick wait the ECC-M1 audit identified as the dominant
-    # cost in the click round-trip (~14-17 ms median on cocoa
-    # settings_app Laptop @ 30 FPS).
-    #
-    # Three subtleties:
-    #
-    #   * The fresh future is armed RIGHT BEFORE the race wait. There
-    #     is no ``await`` between the swap and the race entry, so no
-    #     input callback can interleave to complete the old future
-    #     and lose the signal. ``signalInputEvent`` ALSO defends
-    #     against the consume-and-arm window (its second branch
-    #     creates a fresh future and pre-completes it when the
-    #     current one has already finished) so the path is safe even
-    #     if a future Nim change introduces a yield here.
-    #
-    #   * 60 FPS cap (``MinTickIntervalMs``). When an event wakes the
-    #     race significantly earlier than ``frameIntervalMs``, we
-    #     still defer the next render until at least 16 ms have
-    #     passed since ``lastTickStartMs`` so a runaway input loop
-    #     can't drive the tick rate past ~62.5 FPS. The cap matches
-    #     the audit's projected ~5 ms post-eager floor + a few
-    #     milliseconds of headroom (renderers benchmark at ~16-20 ms
-    #     per frame, so a tighter cap wouldn't buy anything).
-    #
-    #   * Coalescing. Every input event in the residue completes the
-    #     SAME future, so the race wakes exactly once regardless of
-    #     event count. The next tick consumes the batch in a single
-    #     render — N events in one tick budget produce ONE early
-    #     tick, not N ticks.
-    state.inputEventPending = newFuture[void]("bridge.inputEventPending")
-    let sleepFut = sleepAsync(max(1, residueMs))
-    await sleepFut or state.inputEventPending
-    # ECC-M2: 60 FPS cap. If an eager-render signal woke us
-    # significantly earlier than 16 ms after the previous tick start,
-    # pad the wait. Idle / pure-cadence ticks already respect
-    # ``frameIntervalMs`` via residueMs (which is >= MinTickIntervalMs
-    # on the 30 FPS default), so this only fires on eager wakeups
-    # that beat the cap.
-    let nowMs = inMilliseconds(getMonoTime() - MonoTime())
-    let sinceLastTickMs = int(nowMs - state.lastTickStartMs)
-    if sinceLastTickMs < MinTickIntervalMs:
-      await sleepAsync(MinTickIntervalMs - sinceLastTickMs)
+    await sleepAsync(max(1, residueMs))
 
 proc handleInbound(client: AsyncSocket; cfg: BridgeConfig;
                    state: ConnectionState) {.async.} =
@@ -1085,12 +972,6 @@ proc handleInbound(client: AsyncSocket; cfg: BridgeConfig;
           return
         if cfg.inputSink != nil:
           cfg.inputSink.submit(ev)
-        # ECC-M2: signal the frame loop to tick NOW for paint-visible
-        # input kinds. Idempotent / coalesced inside ``signalInputEvent``
-        # so a high-rate stream (drag, scroll) produces at most one
-        # early tick per residue.
-        if isEagerInputEvent(ev):
-          signalInputEvent(state)
       of 'M':
         # Client-originated M packets are decoded for the hello-accept
         # transport selection (ETS-M2). Any decode failure still
@@ -1131,9 +1012,7 @@ proc bridgeOnce(client: AsyncSocket; cfg: BridgeConfig) {.async.} =
                               h264Encoder: cfg.encoderHandle,
                               framesSent: 0,
                               prevFrameSample: @[],
-                              prevWebpFullFrame: none(Frame),
-                              inputEventPending: nil,
-                              lastTickStartMs: 0)
+                              prevWebpFullFrame: none(Frame))
   await sendHello(client, cfg, state)
   # RS-M11: the manifest MUST land before the first F packet so the
   # editor's canvas can hit-test the very first pixel-rendered frame.
