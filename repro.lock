@@ -1,0 +1,9 @@
+schema = "reprobuild.solved-graph-lock.v2"
+
+[lock]
+platform = "amd64-linux"
+optimal = false
+inputs_digest = "fnv1a64:81ffd6bf77b6dc01"
+variants = []
+packages = [{ name = "gcc", version = "12.0.0", source = "gcc" }, { name = "isonim_render_serve", version = "0.1.0", source = "isonim_render_serve" }, { name = "nim", version = "2.0.0", source = "nim" }]
+deps = [{ name = "isonim-render-serve", path = ".", coord_kind = "vcs", url = "https://github.com/metacraft-labs/isonim-render-serve", ref = "mcr-stege0-and-fixes", revision = "646183c5f2d5d57a28a9411026e26c08c33764cc", integrity = "git-sha1:646183c5f2d5d57a28a9411026e26c08c33764cc", version = "", visibility = "public", participation = "", depends = "", groups = "" }]
