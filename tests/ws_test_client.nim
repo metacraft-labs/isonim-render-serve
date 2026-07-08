@@ -3,7 +3,7 @@
 ## WebSocket client built on `asyncnet`.
 
 import std/[asyncdispatch, asyncnet, base64, nativesockets, net,
-            random, strutils]
+            random, strutils, tables]
 
 import isonim_render_serve
 
@@ -62,6 +62,31 @@ type
 
 proc newWsClientState*(): WsClientState =
   WsClientState(dec: initWsFrameDecoder())
+
+# A recv() on the socket can return MORE bytes than the frames a single
+# drain consumes (the bridge streams 256×256 F frames of ~256 KB while
+# the client reads in 16 KiB chunks). Those surplus bytes live in the
+# `WsFrameDecoder.buf` of the `WsClientState` used for that recv. If a
+# test creates a FRESH `WsClientState` for a subsequent drain on the
+# SAME socket, the surplus bytes buffered in the previous decoder are
+# lost and the new decoder starts parsing mid-frame — desyncing the
+# frame boundary and mis-reading payload bytes as a frame header (whose
+# 4-bit opcode has no `WsOpcode` representant → RangeDefect). To make
+# repeated drains on one socket safe, the decoder state is keyed on the
+# socket so it persists for the connection's lifetime.
+var perSocketState = initTable[int, WsClientState]()
+
+proc clientStateFor*(sock: AsyncSocket): WsClientState =
+  ## Return the persistent `WsClientState` bound to `sock`, creating it
+  ## on first use. Reusing this across successive `recvOneMessage` /
+  ## drain calls preserves the decoder's byte buffer so no frame is
+  ## dropped or split at a drain boundary. Keyed on the socket's raw
+  ## file descriptor (an `AsyncSocket` is a ref with no `hash`).
+  let key = int(getFd(sock))
+  result = perSocketState.getOrDefault(key)
+  if result.isNil:
+    result = newWsClientState()
+    perSocketState[key] = result
 
 proc recvOneMessage*(sock: AsyncSocket;
                      state: WsClientState;

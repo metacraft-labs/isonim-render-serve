@@ -71,7 +71,14 @@ proc changedManifest(): ElementTreeManifest =
 proc makeConfigWithProvider(port: int;
                             provider: ElementTreeProvider;
                             streamDelta: bool;
-                            fps = 50; maxFrames = 12): BridgeConfig =
+                            fps = 8; maxFrames = 12): BridgeConfig =
+  ## `fps` defaults low (≈125 ms/frame) so the server's frame loop does
+  ## not buffer the whole `maxFrames` budget before the client drains the
+  ## initial packets and flips the provider's manifest mid-stream. The
+  ## delta/manifest re-emission this suite pins fires from inside
+  ## `sendElementTreeIfChanged`; at 50 fps the flip landed after every
+  ## frame was already rendered, so the changed body never appeared and
+  ## the tests raced.
   BridgeConfig(
     port: Port(port),
     staticDir: ".",
@@ -86,7 +93,10 @@ proc makeConfigWithProvider(port: int;
 proc drainPackets(sock: AsyncSocket; count: int):
                   Future[seq[string]] {.async.} =
   result = newSeq[string]()
-  let state = newWsClientState()
+  # Persistent per-socket decoder: repeated drains on the same socket
+  # must share one `WsFrameDecoder` so surplus recv bytes are not lost
+  # at a drain boundary (see `clientStateFor` in ws_test_client).
+  let state = clientStateFor(sock)
   for _ in 0 ..< count:
     let msg = await recvOneMessage(sock, state)
     if not msg.complete: break

@@ -77,11 +77,17 @@ proc changedManifest(): ElementTreeManifest =
 
 proc makeConfigWithProvider(port: int;
                             provider: ElementTreeProvider;
-                            fps = 50; maxFrames = 6): BridgeConfig =
+                            fps = 8; maxFrames = 6): BridgeConfig =
   ## Mirror of `makeStubConfig` that plugs in an element-tree
   ## provider so the bridge runs through the manifest-emission code
-  ## path. Stub frame source keeps the F packets cheap; the per-tick
-  ## interval is short so the test finishes quickly.
+  ## path. Stub frame source keeps the F packets cheap. `fps` defaults
+  ## low (≈125 ms/frame) so the server's frame loop does not race ahead
+  ## and buffer every frame before the client drains the initial packets
+  ## and flips the provider's manifest between ticks. The re-emission the
+  ## "manifest change triggers a fresh element-tree packet" test pins
+  ## fires from inside `sendElementTreeIfChanged`; at 50 fps the whole
+  ## `maxFrames` budget was rendered before the flip landed, so the
+  ## changed manifest never appeared and the test raced.
   BridgeConfig(
     port: Port(port),
     staticDir: ".",
@@ -97,7 +103,10 @@ proc drainPackets(sock: AsyncSocket; count: int):
   ## Pull `count` complete WS binary messages from the socket and
   ## return their payloads (each is a single F / M / I packet).
   result = newSeq[string]()
-  let state = newWsClientState()
+  # Persistent per-socket decoder: repeated drains on the same socket
+  # must share one `WsFrameDecoder` so surplus recv bytes are not lost
+  # at a drain boundary (see `clientStateFor` in ws_test_client).
+  let state = clientStateFor(sock)
   for _ in 0 ..< count:
     let msg = await recvOneMessage(sock, state)
     if not msg.complete: break
