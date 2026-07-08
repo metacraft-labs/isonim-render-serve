@@ -105,100 +105,135 @@
 ## edges and every BUILD (compile) edge stay unpooled and parallel.
 ##
 ## ---------------------------------------------------------------------
-## DEFERRED sibling-dependent tests (topological bootstrap, NOT dropped).
+## SECOND PASS — sibling-dependent tests RE-ENABLED (renderer siblings
+## have now landed their ``library`` edges).
 ## ---------------------------------------------------------------------
 ##
-## The following 20 test files are NOT given edges in THIS pass because
-## they ``import`` (or, for the two ``nim check --os:`` compile-gate
-## tests, transitively pull via a driven ``nim check``) a workspace
-## SIBLING that has not yet landed its own ``repro.nim`` ``library``
-## edge. They are DEFERRED pending those siblings — a SECOND PASS will
-## add ``uses: "<sibling>"`` for each and re-enable the test edge below.
-## They are documented here, not weakened or deleted; each still runs
-## under the repo's own ``just test`` today.
+## The renderer siblings this repo consumes from source now each ship a
+## landed ``repro.nim`` ``library`` export: ``isonim`` (``library
+## isonim``), ``isonim-gpui`` (``library isonim_gpui``), ``isonim-freya``
+## (``library isonim_freya``), ``isonim-cocoa`` (``library
+## isonim_cocoa``), plus ``nim-everywhere`` (``library nim_everywhere``).
+## They are named in the ``uses:`` block below (SC-11 develop-mode
+## from-source consumption), so reprobuild builds each from source and
+## folds it into the lock. The ``isonim-android`` renderer declares NO
+## ``library`` export (its ``package isonim_android`` block has only
+## ``uses: isonim``), and the ``task_app/*`` demo tree (isonim-examples,
+## whose library is exported at the repo ROOT and which declares ``uses:
+## "isonim-render-serve"`` back) is NOT consumed as a ``uses:`` edge here
+## — pulling it recurses its whole downstream demo graph. Both arrive via
+## the committed ``config.nims`` ``--path:`` switches instead (exactly as
+## ``isonim-examples/config.nims`` threads the android roots); the demo /
+## android modules are plain Nim sources on the path, so no producer
+## sub-build is needed for them.
 ##
-##   Needs isonim-gpui (isonim_gpui/renderer + bindings):
-##     * tests/test_gpui_adapter_element_tree.nim
-##     * tests/test_gpui_adapter_real_pixels.nim
-##     * tests/test_gpui_adapter_renderframe.nim
-##     * tests/test_gpui_adapter_story_generation.nim
-##     * tests/test_gpui_adapter_streams_task_app.nim   (also isonim-examples)
-##     * tests/test_gpui_input_routes_to_fireevent.nim  (also isonim, isonim-examples)
+## FOURTEEN previously-deferred test files are RE-ENABLED in
+## ``renderServeTestSpecs`` below (verified BUILD + RUN green under the
+## repo's default ``nim c --mm:orc -d:release --threads:on -r`` matrix
+## point on this Linux host):
 ##
-##   Needs isonim-freya (isonim_freya/renderer + bindings):
-##     * tests/test_freya_adapter_element_tree.nim
-##     * tests/test_freya_adapter_real_pixels.nim
-##     * tests/test_freya_adapter_renderframe.nim
-##     * tests/test_freya_adapter_streams_task_app.nim  (also isonim-examples)
-##     * tests/test_freya_input_routes_to_fireevent.nim (also isonim, isonim-examples)
-##     * tests/test_freya_render_budget.nim
+##   * gpui:  test_gpui_adapter_element_tree, test_gpui_adapter_real_pixels,
+##            test_gpui_adapter_streams_task_app (pooled — async server),
+##            test_gpui_input_routes_to_fireevent (pooled — async server).
+##   * freya: test_freya_adapter_element_tree, test_freya_adapter_real_pixels,
+##            test_freya_adapter_streams_task_app (pooled — async server),
+##            test_freya_input_routes_to_fireevent (pooled — async server),
+##            test_freya_render_budget (pooled — wall-clock budget).
+##   * cocoa: test_cocoa_adapter_macos_only (Linux: body is
+##            ``when defined(macosx)``-gated → the AppKit path is compiled
+##            out, the suite runs its Linux-scaffold arms to exit 0;
+##            pooled since the macOS arm would spawn the async server),
+##            test_cocoa_adapter_compile (pooled — drives a ``nim check
+##            --os:macosx`` subprocess over the real cocoa adapter sources).
+##   * android: test_android_adapter_element_tree,
+##            test_android_adapter_compile (pooled — drives a ``nim check
+##            --os:android -d:mockJni`` subprocess).
+##   * cross-backend: test_rasteriser_kind_paint (gpui + freya arms run;
+##            cocoa/android arms are ``when defined``-gated out on Linux).
 ##
-##   Needs isonim-cocoa (isonim_cocoa/renderer):
-##     * tests/test_cocoa_adapter_element_tree.nim
-##     * tests/test_cocoa_adapter_macos_only.nim         (also isonim-examples task_app)
-##     * tests/test_cocoa_adapter_compile.nim            (nim check --os:macosx pulls
-##                                                        isonim_cocoa/renderer sources)
+## The ``test_*_real_pixels`` suites self-gate their real-GPU-readback arm
+## with ``skip()`` (the headless ``useGpuiHeadless`` / ``useFreyaHeadless``
+## define is off and the dev shell ships no real GPU/display) and assert
+## the synthetic-fallback path instead — NOT weakened, only the
+## hardware-only arm is skipped; the fallback arm runs to exit 0.
 ##
-##   Needs isonim-android (isonim_android/renderer):
-##     * tests/test_android_adapter_element_tree.nim
-##     * tests/test_android_adapter_compile.nim          (nim check --os:android -d:mockJni
-##                                                        pulls isonim_android/renderer sources)
-##
-##   Needs MULTIPLE renderer siblings at once (gpui + freya + cocoa +
-##   android — per-backend cross-cutting suites):
-##     * tests/test_per_backend_diff_stability.nim
-##     * tests/test_per_backend_hover_dispatch.nim
-##     * tests/test_rasteriser_kind_paint.nim
-##
-## When gpui / freya / cocoa / android (+ isonim, isonim-examples) land
-## their ``library`` edges, the second pass adds the matching
-## ``uses: "<sibling>"`` declarations and lifts each file above into the
-## ``renderServeTestSpecs`` table (bridge/streaming ones through the
-## serial pool; pure adapter ones unpooled). Until then this recipe is a
-## LEAF: no ``uses: "<sibling>"`` edge, and the lock is self-only.
-##
-## ``tests/ws_test_client.nim`` is an IMPORTED helper (a WebSocket client
-## used by the bridge tests via ``import ./ws_test_client``), NOT a
-## standalone ``suite`` test — it gets no edge, only a transitive input
-## of the bridge tests that import it.
-##
-## ---------------------------------------------------------------------
-## DEFERRED — pre-existing HOST-RED tests (NOT a sibling dependency).
-## ---------------------------------------------------------------------
-##
-## The following three LEAF tests (they import ONLY ``isonim_render_serve``
-## + ``./ws_test_client`` + std — no sibling) are DEFERRED for a
-## DIFFERENT reason than the sibling block above: they FAIL DETERMIN-
-## ISTICALLY on this Linux host under the repo's OWN default build
-## (``nim c --mm:orc -d:release --threads:on -r`` — i.e. exactly what
-## ``just test`` runs), with
-##
-##   Unhandled exception: value out of range: 11 notin 0 .. 10 [RangeDefect]
-##
-## in the async WebSocket read path (``asyncfutures.read``) exercised by
-## the ETS-M2 / RS-M11 element-tree-delta manifest flow. This is a
-## PRE-EXISTING product bug in the element-tree bridge path, orthogonal
-## to reprobuild — it reproduces with ``just test`` and is NOT caused by
-## this recipe, the toolchain, or provisioning. Landed by:
-##   * 9973994 RS-M11: element-tree manifest sub-kind + TUI manifest builder
-##   * 75b1538 ETS-M2: manifestKey kind fix + element-tree-delta M-subtype
-##
+## THREE further LEAF tests — previously host-red with a RangeDefect in
+## the async WebSocket read path — are ALSO re-enabled (serial pool; they
+## spawn the async bridge):
 ##     * tests/test_bridge_element_tree_emission.nim
 ##     * tests/test_bridge_emits_delta_when_negotiated.nim
 ##     * tests/test_bridge_manifest_key_kind_propagates.nim
+## The RangeDefect was NOT a manifest/delta product bug (``manifestKey``
+## already spans ``kind``): the WS test client created a FRESH decoder per
+## ``drainPackets`` call, so bytes buffered in the previous decoder from an
+## over-long ``recv`` were dropped and the next drain parsed mid-frame,
+## reading a payload byte as a frame header whose 4-bit opcode (11 / 15)
+## has no ``WsOpcode`` representant → ``RangeDefect``. Fixed by keying the
+## decoder state on the socket so it persists across drains
+## (``ws_test_client.clientStateFor``), plus lowering the tests' default
+## ``fps`` so the mid-stream manifest flip lands before the server
+## exhausts its ``maxFrames`` budget (a pre-existing pacing race the
+## desync had masked). No ``check`` weakened; product ``src/`` unchanged.
 ##
-## They are DOCUMENTED here (not deleted / not weakened): once the
-## underlying ``RangeDefect`` in the element-tree-delta read path is
-## fixed in ``src/``, lift these three back into ``renderServeTestSpecs``
-## (all three through the serial pool — they spawn the async bridge). A
-## red execute edge is deliberately NOT authored so ``repro test`` stays
-## a truthful green over the tests that actually pass on this host.
+## ---------------------------------------------------------------------
+## STILL DEFERRED — stale prebuilt renderer shim (NOT rebuildable here).
+## ---------------------------------------------------------------------
+##
+## THREE tests depend on offscreen-pixel-readback entry points
+## (``gpui_render_to_pixels`` / ``freya_render_to_pixels`` /
+## ``gpui_bump_generation``) that are present in the renderer siblings'
+## Rust SOURCES but ABSENT from the prebuilt ``rust/target/debug/
+## lib{gpui,freya}_nim_shim.so`` cdylibs this host ships. The shims are
+## built out-of-band (the dev shell carries no ``cargo`` to rebuild
+## them — same constraint the ``isonim-gpui`` / ``isonim-freya`` /
+## ``isonim-examples`` recipes document), so the adapter's headless
+## ``*_render_to_pixels`` call misses the export and falls through to the
+## synthetic raster, which paints a non-background pixel for the nil-root
+## case the test pins. This is a stale-artifact/env condition, NOT a
+## render-serve product bug (the adapter is a faithful passthrough) and
+## NOT a reprobuild bug; ``uses: "isonim-gpui"`` threads the sibling
+## SOURCE path but does not rebuild the out-of-band cdylib.
+##
+##     * tests/test_gpui_adapter_renderframe.nim      (nil-root → synthetic,
+##                                                     `gpui_render_to_pixels` absent)
+##     * tests/test_freya_adapter_renderframe.nim     (nil-root → synthetic,
+##                                                     `freya_render_to_pixels` absent)
+##     * tests/test_gpui_adapter_story_generation.nim (`gpui_bump_generation` absent)
+##
+## ---------------------------------------------------------------------
+## STILL DEFERRED — Objective-C / AppKit toolchain absent on Linux.
+## ---------------------------------------------------------------------
+##
+## THREE tests compile the real ``isonim-cocoa`` Objective-C sources
+## DIRECTLY into the test binary (``import
+## isonim_render_serve/adapters/cocoa_adapter`` unconditionally, which
+## pulls ``isonim-cocoa/src/isonim_cocoa/appkit/textcontrols_helper.m``
+## and ``#include <objc/message.h>``). The Linux dev shell has no
+## Objective-C runtime headers, so the ``gcc -c … textcontrols_helper.m``
+## / ``objc/message.h`` include fails at compile time. This is a
+## host-toolchain limitation (macOS-only), NOT a render-serve product
+## bug and NOT a reprobuild bug. (``test_cocoa_adapter_macos_only`` and
+## ``test_cocoa_adapter_compile`` compile FINE because the former gates
+## its AppKit imports behind ``when defined(macosx)`` and the latter
+## reaches the cocoa sources only through a driven ``nim check``
+## subprocess, never linking objc into its own binary.)
+##
+##     * tests/test_cocoa_adapter_element_tree.nim
+##     * tests/test_per_backend_diff_stability.nim
+##     * tests/test_per_backend_hover_dispatch.nim
+##
+## ``tests/ws_test_client.nim`` is an IMPORTED helper (a WebSocket client
+## used by the bridge/streaming tests via ``import ./ws_test_client``),
+## NOT a standalone ``suite`` test — it gets no edge, only a transitive
+## input of the tests that import it.
 ##
 ## **Tool provisioning.** ``defaultToolProvisioning "path"`` matches the
 ## canonical recipes: the nix dev shell puts ``nim`` + ``gcc`` on
 ## ``PATH``, so the weak-local PATH resolver is the right default.
 ## Without it ``repro build`` refuses to run with "typed tool
 ## provisioning is required for uses declarations".
+
+import std/os
 
 import repro_project_dsl
 
@@ -226,6 +261,22 @@ type
     pool: string
 
 const serialPoolName = "isonim_render_serve.bridge-serial"
+
+# Absolute rpath to the prebuilt Freya-shim cdylib directory. The Freya
+# renderer's ``bindings.nim`` FFI is a bare-soname
+# ``{.dynlib: "libfreya_nim_shim.so".}`` (unlike the GPUI shim whose
+# ``bindings.nim`` resolves an ABSOLUTE ``currentSourcePath()``-derived
+# path into ``../isonim-gpui/rust/target/debug`` — so the GPUI shim loads
+# with no rpath/env). Any test that constructs a ``FreyaRenderer`` needs
+# ``libfreya_nim_shim.so`` reachable at run time; baking an absolute
+# ``-Wl,-rpath`` onto every test binary lets the FFI ``dlopen`` the
+# prebuilt sibling shim with NO ``LD_LIBRARY_PATH`` (mirrors the
+# ``isonim-examples`` / ``isonim-freya`` recipes). It is harmless on
+# binaries that never load the shim (an unused rpath entry). The shim is
+# prebuilt out-of-band — the dev shell has no ``cargo`` to rebuild it.
+const repoRoot = currentSourcePath().parentDir()
+let freyaShimRpath =
+  absolutePath(repoRoot / ".." / "isonim-freya" / "rust" / "target" / "debug")
 
 const renderServeTestSpecs: seq[RenderServeTestSpec] = @[
   # --- Pure codec / diff / element-tree round-trips ------------------
@@ -301,6 +352,68 @@ const renderServeTestSpecs: seq[RenderServeTestSpec] = @[
     binary: "build/test-bin/test_webp_encoder_lifecycle", pool: serialPoolName),
   RenderServeTestSpec(source: "tests/test_webp_inprocess_subprocess_parity.nim",
     binary: "build/test-bin/test_webp_inprocess_subprocess_parity", pool: serialPoolName),
+
+  # --- SECOND PASS: renderer-sibling adapter tests (siblings landed) --
+  # Pure adapter / element-tree / real-pixels probes: no async server,
+  # no wall-clock budget → unpooled/parallel. The ``real_pixels`` suites
+  # self-``skip()`` the real-GPU arm and assert the synthetic fallback.
+  RenderServeTestSpec(source: "tests/test_gpui_adapter_element_tree.nim",
+    binary: "build/test-bin/test_gpui_adapter_element_tree", pool: ""),
+  RenderServeTestSpec(source: "tests/test_gpui_adapter_real_pixels.nim",
+    binary: "build/test-bin/test_gpui_adapter_real_pixels", pool: ""),
+  RenderServeTestSpec(source: "tests/test_freya_adapter_element_tree.nim",
+    binary: "build/test-bin/test_freya_adapter_element_tree", pool: ""),
+  RenderServeTestSpec(source: "tests/test_freya_adapter_real_pixels.nim",
+    binary: "build/test-bin/test_freya_adapter_real_pixels", pool: ""),
+  RenderServeTestSpec(source: "tests/test_android_adapter_element_tree.nim",
+    binary: "build/test-bin/test_android_adapter_element_tree", pool: ""),
+  RenderServeTestSpec(source: "tests/test_rasteriser_kind_paint.nim",
+    binary: "build/test-bin/test_rasteriser_kind_paint", pool: ""),
+  # Cross-compile gate tests drive a ``nim check`` subprocess (heavy
+  # child compile) → serial pool so the fork+exec runs with headroom.
+  RenderServeTestSpec(source: "tests/test_cocoa_adapter_compile.nim",
+    binary: "build/test-bin/test_cocoa_adapter_compile", pool: serialPoolName),
+  RenderServeTestSpec(source: "tests/test_android_adapter_compile.nim",
+    binary: "build/test-bin/test_android_adapter_compile", pool: serialPoolName),
+  # Cocoa macOS-only suite: on Linux the AppKit body is
+  # ``when defined(macosx)``-gated out; pooled because the macOS arm
+  # would spawn the async bridge server (import ./ws_test_client).
+  RenderServeTestSpec(source: "tests/test_cocoa_adapter_macos_only.nim",
+    binary: "build/test-bin/test_cocoa_adapter_macos_only", pool: serialPoolName),
+  # Streaming / input-routing suites: spawn the async server + WS client
+  # (import ./ws_test_client) and instantiate the task_app demo as the
+  # frame source → serial pool (same rationale as the bridge tests).
+  RenderServeTestSpec(source: "tests/test_gpui_adapter_streams_task_app.nim",
+    binary: "build/test-bin/test_gpui_adapter_streams_task_app", pool: serialPoolName),
+  RenderServeTestSpec(source: "tests/test_gpui_input_routes_to_fireevent.nim",
+    binary: "build/test-bin/test_gpui_input_routes_to_fireevent", pool: serialPoolName),
+  RenderServeTestSpec(source: "tests/test_freya_adapter_streams_task_app.nim",
+    binary: "build/test-bin/test_freya_adapter_streams_task_app", pool: serialPoolName),
+  RenderServeTestSpec(source: "tests/test_freya_input_routes_to_fireevent.nim",
+    binary: "build/test-bin/test_freya_input_routes_to_fireevent", pool: serialPoolName),
+  # Freya render-budget: asserts a per-frame wall-clock budget → serial
+  # pool so the measurement runs with scheduler headroom (not weakened).
+  RenderServeTestSpec(source: "tests/test_freya_render_budget.nim",
+    binary: "build/test-bin/test_freya_render_budget", pool: serialPoolName),
+
+  # --- Element-tree manifest/delta bridge tests (formerly RangeDefect) -
+  # These spawn the async bridge server + hand-rolled WS client and drive
+  # the ETS-M2 / RS-M11 element-tree manifest flow → serial pool. They
+  # were previously host-red with a RangeDefect; the crash was a
+  # frame-desync in the test WS client (a fresh decoder per drain dropped
+  # socket-buffered bytes) surfacing an unchecked WsOpcode conversion,
+  # plus a frame-loop pacing race that let the server exhaust its
+  # ``maxFrames`` budget before the mid-stream manifest flip landed. Both
+  # were fixed in the tests (persistent per-socket decoder in
+  # ``ws_test_client``; low default ``fps`` so the flip lands mid-stream);
+  # the product manifest/delta emission (``manifestKey`` already spans
+  # ``kind``) was correct and is unchanged. They now run to exit 0.
+  RenderServeTestSpec(source: "tests/test_bridge_element_tree_emission.nim",
+    binary: "build/test-bin/test_bridge_element_tree_emission", pool: serialPoolName),
+  RenderServeTestSpec(source: "tests/test_bridge_emits_delta_when_negotiated.nim",
+    binary: "build/test-bin/test_bridge_emits_delta_when_negotiated", pool: serialPoolName),
+  RenderServeTestSpec(source: "tests/test_bridge_manifest_key_kind_propagates.nim",
+    binary: "build/test-bin/test_bridge_manifest_key_kind_propagates", pool: serialPoolName),
 ]
 
 package isonim_render_serve:
@@ -316,6 +429,32 @@ package isonim_render_serve:
     # resolver under ``nix develop``.
     "nim >=2.0"
     "gcc >=12"
+
+    # SECOND-PASS sibling Nim-library producers (SC-11 develop-mode
+    # from-source consumption). Each names a workspace PROJECT that ships
+    # a landed ``repro.nim`` ``library`` edge; reprobuild builds it from
+    # source and threads its exported root onto this repo's ``nim c
+    # --path:`` via the ``nimPathDirs`` aux channel, and FOLDS it into the
+    # lock. The renderer-adapter tests re-enabled above ``import
+    # isonim_gpui/renderer`` / ``isonim_freya/renderer`` /
+    # ``isonim_cocoa/renderer`` / ``isonim/core/signals``. ``isonim``
+    # re-exports ``nim_everywhere/platform`` so nim-everywhere is a direct
+    # compile input too.
+    "isonim"          # library isonim
+    "isonim-gpui"     # library isonim_gpui
+    "isonim-freya"    # library isonim_freya
+    "isonim-cocoa"    # library isonim_cocoa
+    "nim-everywhere"  # library nim_everywhere
+    # NOTE: the ``task_app/*`` demo tree (isonim-examples) that the
+    # streaming/input tests instantiate, and the ``isonim_android/renderer``
+    # sources the android tests pull, are threaded via the committed
+    # ``config.nims`` ``--path:`` switches, NOT ``uses:`` edges.
+    # ``isonim-examples`` exports its library at the repo ROOT and declares
+    # ``uses: "isonim-render-serve"`` back — consuming it as a ``uses:``
+    # edge pulls its full downstream demo graph rather than a leaf splice;
+    # ``isonim-android`` declares no ``library`` export at all. Both are
+    # plain Nim sources on the path, so the ``config.nims`` switches
+    # resolve them at compile time with no producer sub-build.
 
   # Library declaration — the ``src/`` tree is importable when this
   # package is consumed via ``uses: "isonim_render_serve"``. The umbrella
@@ -365,6 +504,11 @@ package isonim_render_serve:
         defines = @["release"],
         paths = @["src", "tests"],
         mm = "orc",
+        # Bake the absolute Freya-shim rpath so a binary that constructs a
+        # ``FreyaRenderer`` ``dlopen``s the prebuilt sibling
+        # ``libfreya_nim_shim.so`` at run time with no ``LD_LIBRARY_PATH``
+        # (harmless unused rpath on binaries that never load the shim).
+        extraPassL = @["-Wl,-rpath," & freyaShimRpath],
         extraInputs = @["src"],
         actionId = "isonim_render_serve.test_build." & stem)
       buildActions.add(edge.action)
