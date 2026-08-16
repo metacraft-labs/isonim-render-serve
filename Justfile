@@ -1,5 +1,7 @@
 ## Justfile - isonim-render-serve.
 
+set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
+
 alias t := test
 alias fmt := format
 
