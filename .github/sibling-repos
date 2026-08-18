@@ -1,2 +1,32 @@
 # Cross-repo siblings cloned by setup-dev-env at workspace-lock-pinned
 # revisions (see codetracer-specs/Testing/Cross-Repo-CI-Integration.md).
+#
+# This list was empty while `config.nims` already carried a
+# `--path:$config/../<repo>/...` switch for every entry below, so CI compiled
+# with none of them on disk: `just lint` produced ~950 "cannot open file"
+# errors and still reported success (the recipes pipe into `tee` and just's
+# default shell has no pipefail). The list is now exactly the set of sibling
+# path switches `config.nims` declares -- keep the two in step.
+
+# Core: `isonim/...` plus the transitive deps isonim re-exports.
+isonim
+nim-everywhere
+nim-stew
+nim-faststreams
+
+# Renderer adapters (RS-M2/M4/M5/M6). Each adapter module imports
+# `isonim_<backend>/renderer`; the Linux scaffolds compile without the native
+# shim, which is why these are compile-time paths and not run-time deps.
+isonim-gpui
+isonim-freya
+isonim-cocoa
+# `isonim_android/renderer` lives under isonim-android/nim-lib/src, and the
+# broader package under isonim-android/src; config.nims adds both, one clone.
+isonim-android
+
+# RS-M2 streaming integration tests instantiate the canonical task_app demo
+# from isonim-examples and reach isonim-tui's TerminalRenderer transitively.
+isonim-examples
+isonim-tui
+nim-termctl
+nim-pty
