@@ -16,3 +16,4 @@ tests/test_*
 *.exe
 *.pdb
 nimcache/
+.repro/
