@@ -1,5 +1,33 @@
-# Cross-repo siblings cloned by setup-dev-env at workspace-lock-pinned
-# revisions (see codetracer-specs/Testing/Cross-Repo-CI-Integration.md).
+# WHY EVERY ENTRY BELOW CARRIES AN EXPLICIT `=<40-hex sha>`
+#
+# `clone-siblings` resolves a BARE entry from the workspace lock, and raises
+# NEED_LOCK for it -- which makes a missing lock FATAL. No lock is published
+# for this repo's branch tip, so every reprobuild run died in `clone-siblings`
+# with:
+#
+#     ::error::No workspace lock for isonim-render-serve (candidates: ...). Neither a
+#     repo-workspaces locks/<project>/isonim-render-serve/<sha>.xml nor a reprobuild
+#     locks/<project>/isonim-render-serve/<sha>.toml exists in
+#     metacraft-labs/metacraft-manifests@latest.
+#
+# before a single dependency was provisioned. With no bare entry left, nothing
+# needs a revision FROM the lock, so `lock_unavailable()` degrades to a
+# `::warning::` and the clones proceed.
+#
+# Each SHA below is the tip of the ref that sibling's own repository actually
+# uses as its default branch, verified to exist with `git ls-remote` (the refs
+# are NOT uniformly `main` -- see the `@<branch>` note on each line).
+#
+# THIS IS THE FALLBACK, NOT THE GOAL. `clone-siblings.sh` prescribes it in
+# that order: (1) declare these repos in isonim-render-serve's project manifest in
+# metacraft-labs/metacraft-manifests so the lock pins them for every future
+# commit with nothing to maintain; (2) only where (1) is impossible, name a
+# 40-hex commit SHA here -- a commit, never a branch, because a branch tip is
+# exactly the unpinned resolve the mechanism exists to prevent. Delete these
+# `=<sha>` suffixes as soon as (1) lands.
+#
+# Cross-repo siblings cloned by setup-dev-env at the explicit SHAs
+# pinned below (see codetracer-specs/Testing/Cross-Repo-CI-Integration.md).
 #
 # This list was empty while `config.nims` already carried a
 # `--path:$config/../<repo>/...` switch for every entry below, so CI compiled
@@ -9,24 +37,24 @@
 # path switches `config.nims` declares -- keep the two in step.
 
 # Core: `isonim/...` plus the transitive deps isonim re-exports.
-isonim
-nim-everywhere
-nim-stew
-nim-faststreams
+isonim=f39688e6d988d3622ad8575dd87792eeb022bf75  # isonim@dev tip
+nim-everywhere=749f037dd40da1d0c04f499f568dda18f7aebd1b  # nim-everywhere@dev tip
+nim-stew=83eb1157963b7f49351dbdd858355fa990bbe23c  # nim-stew@master tip
+nim-faststreams=ce27581a3e881f782f482cb66dc5b07a02bd615e  # nim-faststreams@stable tip
 
 # Renderer adapters (RS-M2/M4/M5/M6). Each adapter module imports
 # `isonim_<backend>/renderer`; the Linux scaffolds compile without the native
 # shim, which is why these are compile-time paths and not run-time deps.
-isonim-gpui
-isonim-freya
-isonim-cocoa
+isonim-gpui=010b175d67333575385bd472425530238f89edd7  # isonim-gpui@dev tip
+isonim-freya=a8c457424a35f2d10b30073323dfd61bd81b3374  # isonim-freya@dev tip
+isonim-cocoa=137a17f6f97bda72494b843ba1cb3a422b80d395  # isonim-cocoa@dev tip
 # `isonim_android/renderer` lives under isonim-android/nim-lib/src, and the
 # broader package under isonim-android/src; config.nims adds both, one clone.
-isonim-android
+isonim-android=6e9c4502bf16dd07ff99119e032380972a9506ff  # isonim-android@dev tip
 
 # RS-M2 streaming integration tests instantiate the canonical task_app demo
 # from isonim-examples and reach isonim-tui's TerminalRenderer transitively.
-isonim-examples
-isonim-tui
-nim-termctl
-nim-pty
+isonim-examples=bacac9ef64081b030f71d8e38df2c05f73a33952  # isonim-examples@dev tip
+isonim-tui=3104848eac0a2079968463342aed99d43566c5f1  # isonim-tui@dev tip
+nim-termctl=6a440c80d21e8b085200ee1c7c8f32b09945bec5  # nim-termctl@dev tip
+nim-pty=a44c4d0efb1d19fcd4e7ff369e8e7d27af9c84ab  # nim-pty@dev tip
