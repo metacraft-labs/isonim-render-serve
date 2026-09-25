@@ -22,7 +22,7 @@
 ## **No new schema** — this module only composes existing sinks. The
 ## ``iekKeyboard`` schema itself is locked in ``event_dispatch.nim``;
 ## see EPP-M7 § *Schema additions* in
-## ``codetracer-specs/Front-Ends/IsoNim/Editor-Preview-Performance.milestones.org``.
+## ``isonim-specs/Editor-Preview-Performance.milestones.org``.
 
 import ./event_dispatch
 

@@ -2,7 +2,7 @@
 ## JSON schema locked at RS-M0, plus a JSON → `InputEvent` decoder
 ## and an `InputSink` concept that bridge consumers implement.
 ##
-## See `codetracer-specs/Front-Ends/IsoNim/`
+## See `isonim-specs/`
 ## `isonim-render-stream.status.org` § *Architecture sketch — render
 ## streaming* for the canonical schema.
 

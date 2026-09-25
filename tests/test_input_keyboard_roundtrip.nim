@@ -14,7 +14,7 @@
 ## decoded event.
 ##
 ## Spec: EPP-M7 in
-## ``codetracer-specs/Front-Ends/IsoNim/Editor-Preview-Performance.milestones.org``.
+## ``isonim-specs/Editor-Preview-Performance.milestones.org``.
 
 import std/[asyncdispatch, asyncnet, json, random, strutils, unittest]
 

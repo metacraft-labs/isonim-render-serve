@@ -13,7 +13,7 @@
 ##
 ## No mocks; the codec under test is the launcher's real production
 ## path. Spec: RS-M12 § *Wire protocol changes* in
-## ``codetracer-specs/Front-Ends/IsoNim/isonim-render-stream.status.org``.
+## ``isonim-specs/isonim-render-stream.status.org``.
 
 import std/[json, unittest]
 

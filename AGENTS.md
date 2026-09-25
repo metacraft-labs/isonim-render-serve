@@ -82,7 +82,7 @@ isonim_render_serve.nimble               # single-source-of-truth version
 
 The authoritative spec for this library is the RS-M0 / RS-M1
 entries in
-`Front-Ends/IsoNim/isonim-render-stream.status.org` in the
+`isonim-specs/isonim-render-stream.status.org` in the
 `codetracer-specs` repo, specifically the § *Architecture sketch —
 render streaming* section (byte-exact wire protocol, `FrameSource`
 / `InputSink` concept signatures, capability bag schema). Repo-

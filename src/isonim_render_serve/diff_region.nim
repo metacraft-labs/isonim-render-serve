@@ -7,7 +7,7 @@
 ## u32 w, u32 h, u32 length, RGBA bytes}`).
 ##
 ## Algorithm (kept deliberately simple — see RS-M3 in
-## `codetracer-specs/Front-Ends/IsoNim/isonim-render-stream.status.org`
+## `isonim-specs/isonim-render-stream.status.org`
 ## for the scope rules):
 ##
 ##   1. Per-scanline scan: walk the two frames in row-major lockstep.

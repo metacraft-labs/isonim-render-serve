@@ -11,7 +11,7 @@
 ## ``editor/backends/<renderer>.nim``).
 ##
 ## Spec: see *RS-M12* in
-## ``codetracer-specs/Front-Ends/IsoNim/isonim-render-stream.status.org``.
+## ``isonim-specs/isonim-render-stream.status.org``.
 
 import std/json
 

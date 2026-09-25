@@ -1,5 +1,5 @@
 ## F / M / I packet codec — implements the wire format locked at
-## RS-M0 (see `codetracer-specs/Front-Ends/IsoNim/`
+## RS-M0 (see `isonim-specs/`
 ## `isonim-render-stream.status.org` § *Architecture sketch — render
 ## streaming*).
 ##
