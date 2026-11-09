@@ -2,6 +2,10 @@
 test-logs/
 nim-cache/
 bench-results/
+# `repro build` / `repro test` write the test binaries repro.nim declares
+# under build/test-bin/. Left untracked and unignored, they dirty the tree
+# and `repro test` refuses to certify a run whose inputs include them.
+/build/
 
 # direnv local state.
 .direnv/
