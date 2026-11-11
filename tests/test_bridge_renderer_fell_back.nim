@@ -58,6 +58,12 @@ proc makeConfig(port: int; source: AnyFrameSource): BridgeConfig =
 
 suite "PSZ-M3 note 22: a mid-connection fallback fails the connection":
 
+  test "the close code is the one the editor reads (4001)":
+    # The editor's copy of this value is `rendererFellBackCloseCode` in isonim
+    # src/isonim/editor/streaming_preview.nim; its native test pins 4001 too.
+    # Changing the value on one side alone must fail a test here or there.
+    check rendererFellBackCloseCode == 4001'u16
+
   test "a label change after the hello closes with 4001 and sends no fallback frame":
     when defined(windows):
       skip()

@@ -65,15 +65,16 @@ suite "PSZ-M3 notes 20-21: hello carries the frame-source label":
 
 suite "PSZ-M3 note 22: the per-tick frame label of a GPUI source":
 
-  test "currentFrameSourceLabelImpl reports the last frame's label without rendering":
+  test "currentFrameSourceLabelImpl reports the label of the last frame":
+    # The bridge reads this closure on every tick. It is built from the
+    # source's `servedHeadless` field (frameSourceLabelFor), so reading it
+    # renders nothing by construction; a render counter cannot observe a
+    # headless render on this Linux host, so the property is not measured here.
     gpui_bindings.gpui_reset_tree()
     let r = GpuiRenderer()
     let root = r.createElement("div")
     let fs = newGpuiFrameSource(r, root, width = 16, height = 12)
     let any = fs.toAny()
-    # Nothing is rendered yet, so the source reports the label of its last
-    # frame as the fallback default; reading it must not render (the bridge
-    # reads it on every tick).
     check any.currentFrameSourceLabelImpl != nil
     check any.currentFrameSourceLabelImpl() == frameSourceLabelFor(fs.servedHeadless)
     check fs.servedHeadless == false

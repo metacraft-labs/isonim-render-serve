@@ -480,7 +480,11 @@ proc sendHello(client: AsyncSocket; cfg: BridgeConfig;
   # PSZ-M3 note 22: remember what the hello declared, so the frame loop can
   # tell a later change of source from the one the editor was told about.
   state.announcedFrameSource = frameSourceTag
-  state.trackFrameSource = cfg.frameSource.currentFrameSourceLabelImpl != nil
+  # Both closures are needed: the hello's label must come from the same source
+  # as the per-frame label, or a change would be reported against a tag the
+  # source never declared (frame_source.nim, `currentFrameSourceLabelImpl`).
+  state.trackFrameSource = cfg.frameSource.currentFrameSourceLabelImpl != nil and
+                           cfg.frameSource.frameSourceLabelImpl != nil
   let body = buildHelloJson(cfg.backend,
                             cfg.frameSource.width,
                             cfg.frameSource.height,

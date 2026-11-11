@@ -64,7 +64,9 @@ type
       ## must NOT render: the bridge calls it on every tick to detect a
       ## change of source after the hello (a mid-connection fallback), and
       ## a render there would double the cost of every frame. ``nil`` turns
-      ## that check off for the connection.
+      ## that check off for the connection. The bridge checks only when
+      ## ``frameSourceLabelImpl`` is set too, so both closures describe the
+      ## same source.
 
 proc newAnyFrameSource*(width, height: int;
                         renderFrameImpl: proc(): Frame {.closure, gcsafe.};
