@@ -452,12 +452,19 @@ proc sendHello(client: AsyncSocket; cfg: BridgeConfig;
     let webpAvail = isWebPEncoderAvailable()
   else:
     let webpAvail = false
+  # PSZ-M3 note 21: a source that labels its own frames wins over the
+  # static tag, so the hello never declares a label for frames not sent.
+  let frameSourceTag =
+    if cfg.frameSource.frameSourceLabelImpl != nil:
+      cfg.frameSource.frameSourceLabelImpl()
+    else:
+      cfg.frameSourceTag
   let body = buildHelloJson(cfg.backend,
                             cfg.frameSource.width,
                             cfg.frameSource.height,
                             elementTree = cfg.elementTree != nil,
                             capturePath = cfg.capturePath,
-                            frameSourceTag = cfg.frameSourceTag,
+                            frameSourceTag = frameSourceTag,
                             encoder = cfg.encoder,
                             codecId = codecId,
                             webpAvailable = webpAvail,
