@@ -62,3 +62,19 @@ suite "PSZ-M3 notes 20-21: hello carries the frame-source label":
       check declared == "synthetic"
     else:
       check declared == frameSourceLabelFor(fs.servedHeadless)
+
+suite "PSZ-M3 note 22: the per-tick frame label of a GPUI source":
+
+  test "currentFrameSourceLabelImpl reports the last frame's label without rendering":
+    gpui_bindings.gpui_reset_tree()
+    let r = GpuiRenderer()
+    let root = r.createElement("div")
+    let fs = newGpuiFrameSource(r, root, width = 16, height = 12)
+    let any = fs.toAny()
+    # Nothing is rendered yet, so the source reports the label of its last
+    # frame as the fallback default; reading it must not render (the bridge
+    # reads it on every tick).
+    check any.currentFrameSourceLabelImpl != nil
+    check any.currentFrameSourceLabelImpl() == frameSourceLabelFor(fs.servedHeadless)
+    check fs.servedHeadless == false
+    check any.currentFrameSourceLabelImpl() == "synthetic"

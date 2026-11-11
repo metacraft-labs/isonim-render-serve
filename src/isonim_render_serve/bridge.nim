@@ -335,6 +335,18 @@ proc sendClose(client: AsyncSocket; code: uint16;
     discard
   try: client.close() except CatchableError: discard
 
+const
+  rendererFellBackCloseCode* = 4001'u16
+    ## PSZ-M3 note 22: the WebSocket close code (RFC 6455 private range) for a
+    ## connection whose frame source changed its label after the hello: the
+    ## launcher's renderer fell back (a headless error on macOS, or any later
+    ## change of source). The editor reads this code and shows "GPUI preview
+    ## unavailable: renderer fell back" instead of a stale or blank frame. The
+    ## editor's copy of the value is `rendererFellBackCloseCode` in
+    ## isonim `src/isonim/editor/streaming_preview.nim`.
+  rendererFellBackReason* = "renderer fell back: frame source changed after hello"
+    ## The close reason sent with `rendererFellBackCloseCode`.
+
 # ---------------------------------------------------------------------------
 # Per-connection loop
 # ---------------------------------------------------------------------------
@@ -343,6 +355,12 @@ type
   ConnectionState = ref object
     helloSent: bool
     closed: bool
+    announcedFrameSource: string
+      ## PSZ-M3 note 22: the frame-source label the hello declared. A later
+      ## frame whose label differs fails the connection (see `frameLoop`).
+    trackFrameSource: bool
+      ## PSZ-M3 note 22: true when the source can report the label of each
+      ## frame it sends (`currentFrameSourceLabelImpl`), so the check runs.
     lastSentFrame: Option[Frame]
       ## RS-M3: per-connection snapshot of the last full RGBA frame
       ## actually shipped to this client. The diff-region encoder
@@ -459,6 +477,10 @@ proc sendHello(client: AsyncSocket; cfg: BridgeConfig;
       cfg.frameSource.frameSourceLabelImpl()
     else:
       cfg.frameSourceTag
+  # PSZ-M3 note 22: remember what the hello declared, so the frame loop can
+  # tell a later change of source from the one the editor was told about.
+  state.announcedFrameSource = frameSourceTag
+  state.trackFrameSource = cfg.frameSource.currentFrameSourceLabelImpl != nil
   let body = buildHelloJson(cfg.backend,
                             cfg.frameSource.width,
                             cfg.frameSource.height,
@@ -713,6 +735,18 @@ proc frameLoop(client: AsyncSocket; cfg: BridgeConfig;
     if cfg.elementTree != nil:
       await sendElementTreeIfChanged(client, cfg, state)
     let curr = cfg.frameSource.renderFrame()
+
+    # PSZ-M3 note 22: the source changed what it sends after the hello (a
+    # renderer that fell back to the synthetic raster, on a headless error or
+    # later). The editor was told the frames are of the declared source, so a
+    # frame of another source must not reach it as if it were that source, and
+    # the connection fails with a code the editor can name. The frame just
+    # rendered is dropped, not sent.
+    if state.trackFrameSource and
+       cfg.frameSource.currentFrameSourceLabelImpl() != state.announcedFrameSource:
+      await sendClose(client, rendererFellBackCloseCode, rendererFellBackReason)
+      state.closed = true
+      return
 
     # ELT-M8: per-frame transport selection runs ONLY when the
     # launcher booted with ekWebP as its primary — the "opt into

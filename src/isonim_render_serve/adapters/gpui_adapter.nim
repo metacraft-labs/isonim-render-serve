@@ -747,6 +747,10 @@ proc toAny*(src: GpuiFrameSource): AnyFrameSource =
       {.cast(gcsafe).}: captured.close())
   wrapped.frameSourceLabelImpl = proc(): string {.gcsafe.} =
     {.cast(gcsafe).}: captured.gpuiFrameSourceLabel()
+  # PSZ-M3 note 22: the label of the last frame, without rendering. The bridge
+  # reads it every tick to fail the connection when the source falls back.
+  wrapped.currentFrameSourceLabelImpl = proc(): string {.gcsafe.} =
+    {.cast(gcsafe).}: frameSourceLabelFor(captured.servedHeadless)
   wrapped
 
 # ---------------------------------------------------------------------------
