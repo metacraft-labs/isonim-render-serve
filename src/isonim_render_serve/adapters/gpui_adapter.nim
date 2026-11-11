@@ -292,6 +292,19 @@ proc copyShimBufferToFrame(src: GpuiFrameSource;
                            outPtr: ptr uint8; outLen: csize_t): Frame
 proc lastFrameOrSynthetic(src: GpuiFrameSource): Frame
 
+proc gpuiFrameSourceTag*(): string =
+  ## PSZ-M3 note 20: the frame-source label a GPUI launcher passes as
+  ## ``BridgeConfig.frameSourceTag``. The pinned GPUI has a headless
+  ## renderer only on macOS (``current_headless_renderer()`` is ``None``
+  ## elsewhere), and the adapter draws its synthetic raster unless the
+  ## binary is built with ``-d:useGpuiHeadless`` on macOS. Anything else
+  ## is declared ``"synthetic"``. A macOS build with the define can still
+  ## fall back per frame; that fallback is not reflected in the tag.
+  when defined(useGpuiHeadless) and defined(macosx):
+    ""
+  else:
+    "synthetic"
+
 proc renderFrame*(src: GpuiFrameSource): Frame =
   ## Walk the GPUI tree rooted at `src.root` and produce an RGBA8888
   ## frame of `src.width` × `src.height` pixels. Pure function w.r.t.

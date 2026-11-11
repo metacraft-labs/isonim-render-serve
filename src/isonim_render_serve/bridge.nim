@@ -134,6 +134,13 @@ type
       ## hello JSON. The browser-side e2e test asserts that a Cocoa
       ## launcher in a Metal-capable env advertises
       ## ``capabilities.cocoaCapturePath == "metal"``.
+    frameSourceTag*: string
+      ## PSZ-M3 note 20: optional frame-source label the bridge surfaces
+      ## in the ``hello`` capability bag as ``capabilities.frameSource``.
+      ## ``"synthetic"`` means every frame is the tree-derived raster
+      ## (not the native renderer's output), so the editor can label the
+      ## preview. Empty omits the field, which the editor reads as "not
+      ## declared synthetic".
     encoder*: EncoderKind
       ## EPP-M5: which encoder the per-frame render loop should run.
       ## ``ekRawRgba`` (default) keeps the EPP-M4-and-prior F-packet
@@ -220,7 +227,8 @@ proc buildHelloJson*(backend: string; width, height: int;
                      encoder: EncoderKind = ekRawRgba;
                      codecId: string = "";
                      webpAvailable: bool = false;
-                     elementTreeDelta: bool = false): string =
+                     elementTreeDelta: bool = false;
+                     frameSourceTag: string = ""): string =
   ## Build the JSON body for the mandatory first M packet. RS-M0
   ## locks the schema:
   ##   { type: "hello", protocolVersion: 1, backend, capabilities,
@@ -250,6 +258,11 @@ proc buildHelloJson*(backend: string; width, height: int;
                            "keyboard"]
   if capturePath.len > 0:
     caps["cocoaCapturePath"] = newJString(capturePath)
+  # PSZ-M3 note 20: the frame-source label. The editor shows a "synthetic
+  # preview" note when it reads ``"synthetic"``; the field is omitted for
+  # launchers that do not declare one.
+  if frameSourceTag.len > 0:
+    caps["frameSource"] = newJString(frameSourceTag)
   # EPP-M5: advertise the encoder kind in the hello capability bag so
   # the EPP-M6 browser-side decoder can pick the right WebCodecs
   # ``VideoDecoder`` config (or skip configuring one altogether when
@@ -444,6 +457,7 @@ proc sendHello(client: AsyncSocket; cfg: BridgeConfig;
                             cfg.frameSource.height,
                             elementTree = cfg.elementTree != nil,
                             capturePath = cfg.capturePath,
+                            frameSourceTag = cfg.frameSourceTag,
                             encoder = cfg.encoder,
                             codecId = codecId,
                             webpAvailable = webpAvail,
