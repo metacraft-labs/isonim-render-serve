@@ -21,7 +21,7 @@ suite "isonim-render-serve: hello protocol":
 
       proc flow(): Future[MetaPacket] {.async.} =
         let sock = await connectWs(port)
-        let state = newWsClientState()
+        let state = clientStateFor(sock)
         let msg = await recvOneMessage(sock, state)
         sock.close()
         doAssert msg.complete, "no message received"
@@ -59,7 +59,7 @@ suite "isonim-render-serve: hello protocol":
       discard startServer(cfg)
       proc flow(): Future[string] {.async.} =
         let sock = await connectWs(port)
-        let state = newWsClientState()
+        let state = clientStateFor(sock)
         let msg = await recvOneMessage(sock, state)
         sock.close()
         doAssert msg.complete

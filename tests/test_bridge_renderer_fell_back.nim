@@ -76,7 +76,7 @@ suite "PSZ-M3 note 22: a mid-connection fallback fails the connection":
 
       proc flow(): Future[(uint16, string, int)] {.async.} =
         let sock = await connectWs(port)
-        let state = newWsClientState()
+        let state = clientStateFor(sock)
         var binaryAfterHello = 0
         var closeCode: uint16 = 0
         var closeReason = ""

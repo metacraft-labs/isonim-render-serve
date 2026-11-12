@@ -23,7 +23,7 @@ suite "isonim-render-serve: stub frame source over real WS":
 
       proc flow(): Future[seq[Frame]] {.async.} =
         let sock = await connectWs(port)
-        let state = newWsClientState()
+        let state = clientStateFor(sock)
         var frames: seq[Frame] = @[]
         var sawHello = false
         # Drain until we've collected 5 F packets (or the server

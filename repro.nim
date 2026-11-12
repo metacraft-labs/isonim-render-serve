@@ -337,6 +337,10 @@ const renderServeTestSpecs: seq[RenderServeTestSpec] = @[
   # --- Subprocess / async-server tests (capacity-1 serial pool) -----
   # Bridge tests: spawn a real asynchttpserver on an ephemeral port +
   # hand-rolled WS client (import ./ws_test_client).
+  # The shared WS client's handshake, against a scripted loopback server
+  # (one listening socket on an ephemeral port, like the bridge tests).
+  RenderServeTestSpec(source: "tests/test_ws_test_client_keeps_early_bytes.nim",
+    binary: "build/test-bin/test_ws_test_client_keeps_early_bytes", pool: serialPoolName),
   RenderServeTestSpec(source: "tests/test_bridge_hello_first.nim",
     binary: "build/test-bin/test_bridge_hello_first", pool: serialPoolName),
   RenderServeTestSpec(source: "tests/test_bridge_stub_frame_source.nim",

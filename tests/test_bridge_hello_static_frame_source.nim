@@ -62,7 +62,7 @@ suite "PSZ-M3 note 24: a source with a static tag and no label closure":
 
       proc flow(): Future[(string, int, uint16)] {.async.} =
         let sock = await connectWs(port)
-        let state = newWsClientState()
+        let state = clientStateFor(sock)
         var hello = ""
         var binaryCount = 0
         var closeCode: uint16 = 0

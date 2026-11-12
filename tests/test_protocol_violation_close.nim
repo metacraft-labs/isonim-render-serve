@@ -16,7 +16,7 @@ import ./ws_test_client
 proc readUntilClose(sock: AsyncSocket): Future[uint16] {.async.} =
   ## Read messages until a Close frame arrives; return its status
   ## code. Returns 0 if the connection died without one.
-  let state = newWsClientState()
+  let state = clientStateFor(sock)
   for i in 0 ..< 50:
     let msg = await recvOneMessage(sock, state)
     if not msg.complete: return 0
