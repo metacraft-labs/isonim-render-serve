@@ -50,7 +50,7 @@ nim-faststreams=ce27581a3e881f782f482cb66dc5b07a02bd615e  # nim-faststreams@stab
 # Renderer adapters (RS-M2/M4/M5/M6). Each adapter module imports
 # `isonim_<backend>/renderer`; the Linux scaffolds compile without the native
 # shim, which is why these are compile-time paths and not run-time deps.
-isonim-gpui=65e7c654802f1641ef64aa1eb759c7f46f70f1bc  # = repro.lock
+isonim-gpui=47be0f2eecce3823198fefd25e07cbc63e6fc19f  # = repro.lock
 isonim-freya=09ef57f527a121bf9f3dcf1ef6138d99009ecf14  # = repro.lock
 isonim-cocoa=d5733fad04f04df05e726cdc262dcd267f088a09  # = repro.lock
 # `isonim_android/renderer` lives under isonim-android/nim-lib/src, and the
