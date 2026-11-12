@@ -229,7 +229,7 @@
 ## input of the tests that import it.
 ##
 ## **Tool provisioning.** ``defaultToolProvisioning "path"`` matches the
-## canonical recipes: the nix dev shell puts ``nim`` + ``gcc`` on
+## canonical recipes: the nix dev shell puts ``nim`` + the C compiler on
 ## ``PATH``, so the weak-local PATH resolver is the right default.
 ## Without it ``repro build`` refuses to run with "typed tool
 ## provisioning is required for uses declarations".
@@ -283,6 +283,27 @@ const serialPoolName = "isonim_render_serve.bridge-serial"
 const repoRoot = currentSourcePath().parentDir()
 let freyaShimRpath =
   absolutePath(repoRoot / ".." / "isonim-freya" / "rust" / "target" / "debug")
+
+# Windows has no rpath, so the ``-Wl,-rpath`` above does nothing there. The
+# Freya FFI's ``{.dynlib: "freya_nim_shim.dll".}`` is resolved by
+# ``LoadLibrary`` with the bare file name, and the standard search order
+# looks in the directory of the loading ``.exe`` first, then the
+# directories on ``PATH``
+# (https://learn.microsoft.com/en-us/windows/win32/dlls/dynamic-link-library-search-order).
+# ``isonim-freya/rust/target/debug`` is neither, so every test that loaded
+# the shim failed with "could not load: freya_nim_shim.dll" although the
+# shim had been built. The ``build:`` block copies it next to the test
+# binaries (``build/test-bin``) with a declared ``fs.copyFile`` edge, the
+# way isonim-freya stages it beside its own tests. A declared environment
+# cannot do this instead: ``extraEnv`` REPLACES a variable, so it cannot
+# prepend a directory to ``PATH``.
+#
+# The GPUI shim needs no copy: ``isonim_gpui/bindings`` bakes the absolute
+# path of ``isonim-gpui/rust/target/debug/gpui_nim_shim.dll`` into the
+# binary when that file exists at compile time, which it does once the
+# shim is built first (see the header).
+const freyaShimDll = "../isonim-freya/rust/target/debug/freya_nim_shim.dll"
+const stagedFreyaShimDll = "build/test-bin/freya_nim_shim.dll"
 
 const renderServeTestSpecs: seq[RenderServeTestSpec] = @[
   # --- Pure codec / diff / element-tree round-trips ------------------
@@ -463,13 +484,20 @@ package isonim_render_serve:
   uses:
     # Toolchain floor — the PATH-resolvable binaries the build needs.
     # ``nim`` compiles every test binary (the ``buildNimUnittest.build``
-    # edges below) and the library facade; ``gcc`` is the C back-end
-    # ``nim c`` shells out to and links through. The lower bound mirrors
-    # the nimble file's ``requires "nim >= 2.0.0"``; ``gcc >=12`` matches
-    # the workspace toolchain floor. Sufficient for the path-mode
-    # resolver under ``nix develop``.
+    # edges below) and the library facade. The lower bound mirrors the
+    # nimble file's ``requires "nim >= 2.0.0"``. The C compiler is the
+    # back-end ``nim c`` shells out to and links through: native Nim
+    # selects Clang on Darwin and GCC elsewhere, so declare the one it
+    # actually runs. Action-scoped tool selection keeps only the compilers
+    # a recipe declares, and with ``gcc`` alone every macOS compile action
+    # failed with "clang: command not found". ``gcc >=12`` matches the
+    # workspace toolchain floor. Sufficient for the path-mode resolver
+    # under ``nix develop``.
     "nim >=2.0"
-    "gcc >=12"
+    when defined(macosx):
+      "clang"
+    else:
+      "gcc >=12"
     # ``cargo`` and ``just`` serve ``just build`` / ``just test``, which CI
     # runs through ``dev-exec`` in this package's environment. The test
     # recipes ask ``cargo metadata`` (through ``../isonim-freya/tools/
@@ -537,6 +565,17 @@ package isonim_render_serve:
     let serialPool = buildPool(serialPoolName, 1'u32)
     discard serialPool
 
+    # Windows only: stage the Freya shim beside the test binaries (see
+    # ``freyaShimDll`` above). Every execute edge runs after the copy and
+    # lists the staged file as a required input, so a changed shim re-runs
+    # the tests that load it.
+    var shimRuntime: seq[string] = @[]
+    var shimRuntimeAfter: seq[BuildActionDef] = @[]
+    when defined(windows):
+      shimRuntimeAfter.add(fs.copyFile(freyaShimDll, stagedFreyaShimDll,
+        actionId = "isonim_render_serve.stage_freya_shim_dll"))
+      shimRuntime.add(stagedFreyaShimDll)
+
     proc emitTestPair(source, binary, pool: string;
                       buildActions, executeActions: var seq[BuildActionDef]) =
       var lastSlash = -1
@@ -568,11 +607,15 @@ package isonim_render_serve:
         if pool.len > 0:
           edge.testBinary.run(
             actionId = "isonim_render_serve.test_execute." & stem,
+            after = shimRuntimeAfter,
+            requiredBinaries = shimRuntime,
             pool = pool,
             registerImplicitName = false)
         else:
           edge.testBinary.run(
             actionId = "isonim_render_serve.test_execute." & stem,
+            after = shimRuntimeAfter,
+            requiredBinaries = shimRuntime,
             registerImplicitName = false)
       executeActions.add(executeEdge)
 
