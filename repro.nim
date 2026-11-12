@@ -176,29 +176,30 @@
 ## desync had masked). No ``check`` weakened; product ``src/`` unchanged.
 ##
 ## ---------------------------------------------------------------------
-## STILL DEFERRED — stale prebuilt renderer shim (NOT rebuildable here).
+## The renderer shims — built by their owners, not by this graph.
 ## ---------------------------------------------------------------------
 ##
-## THREE tests depend on offscreen-pixel-readback entry points
-## (``gpui_render_to_pixels`` / ``freya_render_to_pixels`` /
-## ``gpui_bump_generation``) that are present in the renderer siblings'
-## Rust SOURCES but ABSENT from the prebuilt ``rust/target/debug/
-## lib{gpui,freya}_nim_shim.so`` cdylibs this host ships. The shims are
-## built out-of-band (the dev shell carries no ``cargo`` to rebuild
-## them — same constraint the ``isonim-gpui`` / ``isonim-freya`` /
-## ``isonim-examples`` recipes document), so the adapter's headless
-## ``*_render_to_pixels`` call misses the export and falls through to the
-## synthetic raster, which paints a non-background pixel for the nil-root
-## case the test pins. This is a stale-artifact/env condition, NOT a
-## render-serve product bug (the adapter is a faithful passthrough) and
-## NOT a reprobuild bug; ``uses: "isonim-gpui"`` threads the sibling
-## SOURCE path but does not rebuild the out-of-band cdylib.
+## The GPUI and Freya adapter tests load ``libgpui_nim_shim`` and
+## ``libfreya_nim_shim``, Rust cdylibs that isonim-gpui and isonim-freya
+## build (each with ``just rust-build``, and as a ``cargo.build`` edge of
+## its own recipe). ``uses: "isonim-gpui"`` / ``uses: "isonim-freya"``
+## thread the siblings' Nim sources only: reprobuild does not build a
+## pure-Nim-source producer's other edges for a consumer, and offers no
+## way to name them as inputs here. So the shims must be built before
+## ``repro build`` / ``repro test`` runs, which both CI workflows do with
+## the owners' recipes, and a changed shim does not invalidate a cached
+## test result. Two tests that were deferred while this host carried a
+## stale prebuilt shim run again, against shims built from the pinned
+## sources:
 ##
-##     * tests/test_gpui_adapter_renderframe.nim      (nil-root → synthetic,
-##                                                     `gpui_render_to_pixels` absent)
-##     * tests/test_freya_adapter_renderframe.nim     (nil-root → synthetic,
-##                                                     `freya_render_to_pixels` absent)
-##     * tests/test_gpui_adapter_story_generation.nim (`gpui_bump_generation` absent)
+##     * tests/test_gpui_adapter_renderframe.nim
+##     * tests/test_freya_adapter_renderframe.nim
+##
+## A third stays deferred: tests/test_gpui_adapter_story_generation.nim
+## submits a headless render token, which only a shim built with
+## isonim-gpui's ``gpui-headless`` cargo feature issues. The default shim
+## the owner's ``rust-build`` produces answers ``-100`` (unavailable), so
+## the stale-token case fails against it.
 ##
 ## ---------------------------------------------------------------------
 ## STILL DEFERRED — Objective-C / AppKit toolchain absent on Linux.
@@ -236,6 +237,8 @@
 import std/os
 
 import repro_project_dsl
+# ``useFlakeDevShell`` (the ``devEnv:`` activation below).
+import repro_dsl_stdlib/foreign_env
 
 # ``ct_test_nim_unittest`` supplies the ``buildNimUnittest.build(...)``
 # typed-tool used by every test BUILD edge below, and the
@@ -273,7 +276,10 @@ const serialPoolName = "isonim_render_serve.bridge-serial"
 # prebuilt sibling shim with NO ``LD_LIBRARY_PATH`` (mirrors the
 # ``isonim-examples`` / ``isonim-freya`` recipes). It is harmless on
 # binaries that never load the shim (an unused rpath entry). The shim is
-# prebuilt out-of-band — the dev shell has no ``cargo`` to rebuild it.
+# built by isonim-freya's own recipe before this graph runs (see the
+# header). ``rust/target/debug`` is where isonim-freya's ``cargo.build``
+# edge declares it; a CARGO_TARGET_DIR outside the checkout moves it, and
+# this rpath then misses it.
 const repoRoot = currentSourcePath().parentDir()
 let freyaShimRpath =
   absolutePath(repoRoot / ".." / "isonim-freya" / "rust" / "target" / "debug")
@@ -345,6 +351,10 @@ const renderServeTestSpecs: seq[RenderServeTestSpec] = @[
     binary: "build/test-bin/test_protocol_violation_close", pool: serialPoolName),
   RenderServeTestSpec(source: "tests/test_v_packet_emission.nim",
     binary: "build/test-bin/test_v_packet_emission", pool: serialPoolName),
+  RenderServeTestSpec(source: "tests/test_bridge_hello_static_frame_source.nim",
+    binary: "build/test-bin/test_bridge_hello_static_frame_source", pool: serialPoolName),
+  RenderServeTestSpec(source: "tests/test_bridge_renderer_fell_back.nim",
+    binary: "build/test-bin/test_bridge_renderer_fell_back", pool: serialPoolName),
   # WebP tests that fork an ffmpeg child on their non-skipped arms:
   # serialized so the fork+exec runs with headroom (arms ``skip()`` when
   # ffmpeg is absent — no check weakened either way).
@@ -369,6 +379,16 @@ const renderServeTestSpecs: seq[RenderServeTestSpec] = @[
     binary: "build/test-bin/test_android_adapter_element_tree", pool: ""),
   RenderServeTestSpec(source: "tests/test_rasteriser_kind_paint.nim",
     binary: "build/test-bin/test_rasteriser_kind_paint", pool: ""),
+  # Shim-backed nil-root probes (previously deferred over a stale
+  # prebuilt shim; see the header).
+  RenderServeTestSpec(source: "tests/test_gpui_adapter_renderframe.nim",
+    binary: "build/test-bin/test_gpui_adapter_renderframe", pool: ""),
+  RenderServeTestSpec(source: "tests/test_freya_adapter_renderframe.nim",
+    binary: "build/test-bin/test_freya_adapter_renderframe", pool: ""),
+  # PSZ-M3 frame-source label in the hello (no server; its GPUI-source
+  # cases load the GPUI shim).
+  RenderServeTestSpec(source: "tests/test_hello_frame_source.nim",
+    binary: "build/test-bin/test_hello_frame_source", pool: ""),
   # Cross-compile gate tests drive a ``nim check`` subprocess (heavy
   # child compile) → serial pool so the fork+exec runs with headroom.
   RenderServeTestSpec(source: "tests/test_cocoa_adapter_compile.nim",
@@ -417,6 +437,23 @@ const renderServeTestSpecs: seq[RenderServeTestSpec] = @[
 ]
 
 package isonim_render_serve:
+  # ``repro exec`` (CI's ``dev-exec`` under ci-reprobuild.yml, which runs
+  # ``just build`` / ``just test`` through it) activates the flake's dev
+  # shell, as the isonim-gpui and isonim-freya recipes do. Those recipes
+  # need more than the ``uses:`` toolchain: ``libwebp`` on the loader path
+  # for the in-process WebP encoder, ``nim`` on PATH for the cross-compile
+  # gate tests, and ``markdownlint-cli2`` / ``nixfmt`` for ``just lint``.
+  #
+  # This does NOT reach the actions of ``repro build`` / ``repro test``:
+  # they inherit the environment ``repro`` itself was started in. Started
+  # outside the dev shell (as ci-reprobuild.yml starts them), the bridge
+  # tests fail with "could not load: libwebp.so.7" and the cross-compile
+  # gate tests with "nim: command not found"; reprobuild has no ``libwebp``
+  # package to declare here.
+  devEnv:
+    when not defined(windows):
+      useFlakeDevShell()
+
   defaultToolProvisioning "path"
 
   uses:
@@ -429,6 +466,13 @@ package isonim_render_serve:
     # resolver under ``nix develop``.
     "nim >=2.0"
     "gcc >=12"
+    # ``cargo`` and ``just`` serve ``just build`` / ``just test``, which CI
+    # runs through ``dev-exec`` in this package's environment. The test
+    # recipes ask ``cargo metadata`` (through ``../isonim-freya/tools/
+    # with_shim_path.sh``) where the Freya shim was built. Nothing here
+    # compiles Rust: each sibling builds its shim in its own environment.
+    "cargo >=1.85"
+    "just >=1"
 
     # SECOND-PASS sibling Nim-library producers (SC-11 develop-mode
     # from-source consumption). Each names a workspace PROJECT that ships

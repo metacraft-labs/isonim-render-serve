@@ -30,7 +30,12 @@ test-unit:
           -r $t 2>&1 | tee -a test-logs/test-unit.log; \
     done
 
+# The integration tests load the GPUI and Freya renderer shims; see
+# `_matrix` for how each shim is found.
 test-integration:
+    ../isonim-freya/tools/with_shim_path.sh just _test-integration
+
+_test-integration:
     @mkdir -p test-logs
     @for t in tests/test_bridge_hello_first.nim tests/test_bridge_stub_frame_source.nim tests/test_bridge_input_roundtrip.nim tests/test_protocol_violation_close.nim tests/test_gpui_adapter_renderframe.nim tests/test_gpui_adapter_streams_task_app.nim tests/test_gpui_input_routes_to_fireevent.nim tests/test_bridge_diff_streaming.nim tests/test_freya_adapter_renderframe.nim tests/test_freya_adapter_streams_task_app.nim tests/test_freya_input_routes_to_fireevent.nim; do \
       echo "[integration] $t"; \
@@ -53,7 +58,26 @@ test-threads-off:
 
 test-all: test-orc test-arc test-refc test-threads-off
 
+# The tests load two Rust cdylibs that this repository does not build: the
+# GPUI shim (isonim-gpui) and the Freya shim (isonim-freya). Build each with
+# its owner's recipe first: `just rust-build` in ../isonim-gpui and in
+# ../isonim-freya. Each shim is then found the way its owner provides:
+#
+# * Freya: `isonim_freya/bindings` loads `libfreya_nim_shim` by bare soname.
+#   `../isonim-freya/tools/with_shim_path.sh` asks cargo where it built it
+#   (honouring CARGO_TARGET_DIR) and puts that directory on the loader path.
+#   It needs `cargo` on PATH, which the dev shell provides.
+# * GPUI: `isonim_gpui/bindings` bakes the absolute path of
+#   ../isonim-gpui/rust/target/debug/libgpui_nim_shim.so into the binary when
+#   that file exists at compile time, and falls back to the bare soname. With
+#   CARGO_TARGET_DIR set the fallback applies, and the soname resolves only
+#   because the loader path above also holds the GPUI shim when both siblings
+#   share one absolute CARGO_TARGET_DIR. isonim-gpui has no locator of its own
+#   yet.
 _matrix mm mode threads:
+    ../isonim-freya/tools/with_shim_path.sh just _matrix-run {{mm}} {{mode}} {{threads}}
+
+_matrix-run mm mode threads:
     @mkdir -p test-logs
     @for t in {{tests}}; do \
       echo "[{{mm}}/{{mode}}/threads:{{threads}}] $t"; \

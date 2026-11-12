@@ -125,16 +125,19 @@
                 # direct API call under the 16 ms budget.
                 libwebp
                 pkg-config
+                # The tests load the Freya renderer shim through
+                # `../isonim-freya/tools/with_shim_path.sh` (see the Justfile's
+                # `_matrix`), which asks `cargo metadata` where cargo put it,
+                # so that a CARGO_TARGET_DIR outside the checkout is honoured.
+                # Nothing here builds Rust; the siblings build their own shims.
+                cargo
               ]
               ++ pkgs.lib.optionals (pkgs.lib.hasSuffix "linux" system) [
                 # RS-M2: the GPUI streaming adapter (and the integration
                 # tests that exercise it) load `libgpui_nim_shim.so` at
                 # run time via `{.dynlib.}`. The shim itself is built
-                # in the `isonim-gpui` repo (`just rust-build`). Even in
-                # the headless stub mode the shim has no extra link-time
-                # deps, so the only thing this dev shell needs to
-                # provide is the loader search path. We extend
-                # `LD_LIBRARY_PATH` in `shellHook` below.
+                # in the `isonim-gpui` repo (`just rust-build`), and the
+                # Justfile's `_matrix` says how the tests find it.
                 tree-sitter
               ];
             shellHook = ''
@@ -155,22 +158,11 @@
                     export LD_LIBRARY_PATH="${pkgs.libwebp}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
                   ''
               }
-              # RS-M2: extend LD_LIBRARY_PATH so `nim c -r` driven tests
-              # that import `isonim_gpui/renderer` find the shim cdylib.
-              # The shim is built once via `cd ../isonim-gpui && just
-              # rust-build`; this hook just makes the loader find it.
-              if [ -d "$PWD/../isonim-gpui/rust/target/debug" ]; then
-                export LD_LIBRARY_PATH="$PWD/../isonim-gpui/rust/target/debug''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-              fi
-              # RS-M4: same trick for the Freya adapter. The shim is
-              # built via `cd ../isonim-freya && just rust-build`;
-              # this hook makes `libfreya_nim_shim.so` resolvable at
-              # run time so `nim c -r` tests that import
-              # `isonim_freya/renderer` (transitively through the
-              # adapter / the EX-M4 task_app demo) link cleanly.
-              if [ -d "$PWD/../isonim-freya/rust/target/debug" ]; then
-                export LD_LIBRARY_PATH="$PWD/../isonim-freya/rust/target/debug''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-              fi
+              # The renderer shims are NOT put on the loader path here. A path
+              # fixed when the shell starts (`../isonim-*/rust/target/debug`)
+              # misses a shim cargo wrote under CARGO_TARGET_DIR, and misses one
+              # built after the shell started. The Justfile's test recipes ask
+              # each sibling where its shim is instead (see `_matrix`).
               # RS-M5 (partial-linux): the Cocoa adapter
               # (`src/isonim_render_serve/adapters/cocoa_adapter.nim`)
               # is scaffolded here on Linux; its AppKit-touching body

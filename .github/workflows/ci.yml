@@ -86,6 +86,17 @@ jobs:
           gh-token: ${{ steps.app-token.outputs.token }}
           substituters: ${{ vars.SUBSTITUTERS }}
           trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
+      # The tests load the GPUI and Freya renderer shims, Rust cdylibs owned by
+      # isonim-gpui and isonim-freya. Each is built by its owner's own recipe,
+      # in its owner's dev shell: `dev-exec` runs `nix develop` for the flake of
+      # the directory it is started in. Without this step every test that
+      # constructs a renderer failed with "could not load: libgpui_nim_shim.so".
+      # The Justfile's `_matrix` recipe says how the tests then find each shim,
+      # including under a runner-wide CARGO_TARGET_DIR.
+      - name: Build the renderer shims with their owners' recipes
+        run: |
+          (cd ../isonim-gpui && dev-exec just rust-build)
+          (cd ../isonim-freya && dev-exec just rust-build)
       - run: dev-exec just test
       - if: always()
         uses: actions/upload-artifact@v4
@@ -126,6 +137,17 @@ jobs:
           gh-token: ${{ steps.app-token.outputs.token }}
           substituters: ${{ vars.SUBSTITUTERS }}
           trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
+      # The tests load the GPUI and Freya renderer shims, Rust cdylibs owned by
+      # isonim-gpui and isonim-freya. Each is built by its owner's own recipe,
+      # in its owner's dev shell: `dev-exec` runs `nix develop` for the flake of
+      # the directory it is started in. Without this step every test that
+      # constructs a renderer failed with "could not load: libgpui_nim_shim.so".
+      # The Justfile's `_matrix` recipe says how the tests then find each shim,
+      # including under a runner-wide CARGO_TARGET_DIR.
+      - name: Build the renderer shims with their owners' recipes
+        run: |
+          (cd ../isonim-gpui && dev-exec just rust-build)
+          (cd ../isonim-freya && dev-exec just rust-build)
       - run: dev-exec just _matrix ${{ matrix.mm }} ${{ matrix.mode }} ${{ matrix.threads }}
       - if: always()
         uses: actions/upload-artifact@v4

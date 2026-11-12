@@ -53,6 +53,11 @@ just lint            # nim check + nixfmt --check
 just format          # nimpretty + nixfmt
 ```
 
+`just test` loads the GPUI and Freya renderer shims, which their own
+repositories build. Run `just rust-build` in `../isonim-gpui` and in
+`../isonim-freya` (each in its own dev shell) first; the Justfile's `_matrix`
+recipe explains how the tests then find each shim.
+
 ## Project structure
 
 ```text
