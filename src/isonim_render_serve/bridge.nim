@@ -134,6 +134,13 @@ type
       ## hello JSON. The browser-side e2e test asserts that a Cocoa
       ## launcher in a Metal-capable env advertises
       ## ``capabilities.cocoaCapturePath == "metal"``.
+    frameSourceTag*: string
+      ## PSZ-M3 note 20: optional frame-source label the bridge surfaces
+      ## in the ``hello`` capability bag as ``capabilities.frameSource``.
+      ## ``"synthetic"`` means every frame is the tree-derived raster
+      ## (not the native renderer's output), so the editor can label the
+      ## preview. Empty omits the field, which the editor reads as "not
+      ## declared synthetic".
     encoder*: EncoderKind
       ## EPP-M5: which encoder the per-frame render loop should run.
       ## ``ekRawRgba`` (default) keeps the EPP-M4-and-prior F-packet
@@ -220,7 +227,8 @@ proc buildHelloJson*(backend: string; width, height: int;
                      encoder: EncoderKind = ekRawRgba;
                      codecId: string = "";
                      webpAvailable: bool = false;
-                     elementTreeDelta: bool = false): string =
+                     elementTreeDelta: bool = false;
+                     frameSourceTag: string = ""): string =
   ## Build the JSON body for the mandatory first M packet. RS-M0
   ## locks the schema:
   ##   { type: "hello", protocolVersion: 1, backend, capabilities,
@@ -250,6 +258,11 @@ proc buildHelloJson*(backend: string; width, height: int;
                            "keyboard"]
   if capturePath.len > 0:
     caps["cocoaCapturePath"] = newJString(capturePath)
+  # PSZ-M3 note 20: the frame-source label. The editor shows a "synthetic
+  # preview" note when it reads ``"synthetic"``; the field is omitted for
+  # launchers that do not declare one.
+  if frameSourceTag.len > 0:
+    caps["frameSource"] = newJString(frameSourceTag)
   # EPP-M5: advertise the encoder kind in the hello capability bag so
   # the EPP-M6 browser-side decoder can pick the right WebCodecs
   # ``VideoDecoder`` config (or skip configuring one altogether when
@@ -322,6 +335,18 @@ proc sendClose(client: AsyncSocket; code: uint16;
     discard
   try: client.close() except CatchableError: discard
 
+const
+  rendererFellBackCloseCode* = 4001'u16
+    ## PSZ-M3 note 22: the WebSocket close code (RFC 6455 private range) for a
+    ## connection whose frame source changed its label after the hello: the
+    ## launcher's renderer fell back (a headless error on macOS, or any later
+    ## change of source). The editor reads this code and shows "GPUI preview
+    ## unavailable: renderer fell back" instead of a stale or blank frame. The
+    ## editor's copy of the value is `rendererFellBackCloseCode` in
+    ## isonim `src/isonim/editor/streaming_preview.nim`.
+  rendererFellBackReason* = "renderer fell back: frame source changed after hello"
+    ## The close reason sent with `rendererFellBackCloseCode`.
+
 # ---------------------------------------------------------------------------
 # Per-connection loop
 # ---------------------------------------------------------------------------
@@ -330,6 +355,12 @@ type
   ConnectionState = ref object
     helloSent: bool
     closed: bool
+    announcedFrameSource: string
+      ## PSZ-M3 note 22: the frame-source label the hello declared. A later
+      ## frame whose label differs fails the connection (see `frameLoop`).
+    trackFrameSource: bool
+      ## PSZ-M3 note 22: true when the source can report the label of each
+      ## frame it sends (`currentFrameSourceLabelImpl`), so the check runs.
     lastSentFrame: Option[Frame]
       ## RS-M3: per-connection snapshot of the last full RGBA frame
       ## actually shipped to this client. The diff-region encoder
@@ -439,11 +470,27 @@ proc sendHello(client: AsyncSocket; cfg: BridgeConfig;
     let webpAvail = isWebPEncoderAvailable()
   else:
     let webpAvail = false
+  # PSZ-M3 note 21: a source that labels its own frames wins over the
+  # static tag, so the hello never declares a label for frames not sent.
+  let frameSourceTag =
+    if cfg.frameSource.frameSourceLabelImpl != nil:
+      cfg.frameSource.frameSourceLabelImpl()
+    else:
+      cfg.frameSourceTag
+  # PSZ-M3 note 22: remember what the hello declared, so the frame loop can
+  # tell a later change of source from the one the editor was told about.
+  state.announcedFrameSource = frameSourceTag
+  # Both closures are needed: the hello's label must come from the same source
+  # as the per-frame label, or a change would be reported against a tag the
+  # source never declared (frame_source.nim, `currentFrameSourceLabelImpl`).
+  state.trackFrameSource = cfg.frameSource.currentFrameSourceLabelImpl != nil and
+                           cfg.frameSource.frameSourceLabelImpl != nil
   let body = buildHelloJson(cfg.backend,
                             cfg.frameSource.width,
                             cfg.frameSource.height,
                             elementTree = cfg.elementTree != nil,
                             capturePath = cfg.capturePath,
+                            frameSourceTag = frameSourceTag,
                             encoder = cfg.encoder,
                             codecId = codecId,
                             webpAvailable = webpAvail,
@@ -692,6 +739,18 @@ proc frameLoop(client: AsyncSocket; cfg: BridgeConfig;
     if cfg.elementTree != nil:
       await sendElementTreeIfChanged(client, cfg, state)
     let curr = cfg.frameSource.renderFrame()
+
+    # PSZ-M3 note 22: the source changed what it sends after the hello (a
+    # renderer that fell back to the synthetic raster, on a headless error or
+    # later). The editor was told the frames are of the declared source, so a
+    # frame of another source must not reach it as if it were that source, and
+    # the connection fails with a code the editor can name. The frame just
+    # rendered is dropped, not sent.
+    if state.trackFrameSource and
+       cfg.frameSource.currentFrameSourceLabelImpl() != state.announcedFrameSource:
+      await sendClose(client, rendererFellBackCloseCode, rendererFellBackReason)
+      state.closed = true
+      return
 
     # ELT-M8: per-frame transport selection runs ONLY when the
     # launcher booted with ekWebP as its primary — the "opt into

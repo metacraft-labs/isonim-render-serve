@@ -53,6 +53,20 @@ type
     width*, height*: int
     renderFrameImpl*: proc(): Frame {.closure, gcsafe.}
     closeImpl*: proc() {.closure, gcsafe.}
+    frameSourceLabelImpl*: proc(): string {.closure, gcsafe.}
+      ## PSZ-M3 note 21: optional. When set, the bridge's hello takes its
+      ## ``capabilities.frameSource`` label from this closure instead of
+      ## ``BridgeConfig.frameSourceTag``, so the label is the one of the
+      ## frames the source sends. ``nil`` leaves the static tag in force.
+    currentFrameSourceLabelImpl*: proc(): string {.closure, gcsafe.}
+      ## PSZ-M3 note 22: optional. The label of the frame the source last
+      ## returned from ``renderFrame``. Unlike ``frameSourceLabelImpl`` it
+      ## must NOT render: the bridge calls it on every tick to detect a
+      ## change of source after the hello (a mid-connection fallback), and
+      ## a render there would double the cost of every frame. ``nil`` turns
+      ## that check off for the connection. The bridge checks only when
+      ## ``frameSourceLabelImpl`` is set too, so both closures describe the
+      ## same source.
 
 proc newAnyFrameSource*(width, height: int;
                         renderFrameImpl: proc(): Frame {.closure, gcsafe.};
