@@ -89,6 +89,13 @@ type
                               ## through to the synchronous
                               ## ``gpui_render_to_pixels`` path
                               ## without re-trying the worker.
+    servedHeadless*: bool     ## PSZ-M3 note 21: ``true`` only when the
+                              ## last frame ``renderFrame`` returned came
+                              ## from the headless GPUI render. Every other
+                              ## frame, including a headless error that fell
+                              ## back to the synthetic raster, sets it false,
+                              ## so the frame-source label follows the frame
+                              ## actually sent.
 
 # ---------------------------------------------------------------------------
 # Layout heuristic: pack the element tree into stacked rectangles.
@@ -315,11 +322,37 @@ proc renderFrame*(src: GpuiFrameSource): Frame =
   when defined(useGpuiHeadless):
     let frame = renderHeadlessFrame(src)
     if frame.pixels.len == src.width * src.height * 4:
+      src.servedHeadless = true
       return frame
     # Fall through to synthetic on size mismatch / capture failure /
     # platform without a headless renderer — same defence as the
     # Rust-side `SizeMismatch` / `RendererUnavailable` error codes.
+  src.servedHeadless = false
   renderSyntheticFrame(src)
+
+proc frameSourceLabelFor*(servedHeadless: bool): string =
+  ## The decision behind ``gpuiFrameSourceLabel``: the label of the frame a
+  ## source last sent. ``"real"`` for a headless GPUI frame, ``"synthetic"``
+  ## for the tree-derived raster. Pure, so the mapping is testable without a
+  ## shim. Both values are declared, so the editor never has to infer one from
+  ## the absence of the other.
+  if servedHeadless: "real" else: "synthetic"
+
+proc gpuiFrameSourceLabel*(src: GpuiFrameSource): string =
+  ## PSZ-M3 note 21: the frame-source label the hello declares for this
+  ## source, as ``capabilities.frameSource``. ``""`` means the frames are
+  ## the headless GPUI render; ``"synthetic"`` means they are the tree-derived
+  ## raster. The label follows the frame the source last returned, so a
+  ## headless build that fell back on a headless error reports "synthetic".
+  ##
+  ## The bridge reads the label once, when it sends the hello, before any
+  ## frame of that connection. In a headless build the label is therefore
+  ## taken from one frame rendered here, so that the hello describes a frame
+  ## the bridge will actually send. A later per-frame fallback is not
+  ## reflected in an already-sent hello (see the PSZ-M3 note 21 record).
+  when defined(useGpuiHeadless):
+    discard src.renderFrame()
+  frameSourceLabelFor(src.servedHeadless)
 
 proc copyShimBufferToFrame(src: GpuiFrameSource;
                            outPtr: ptr uint8; outLen: csize_t): Frame =
@@ -704,13 +737,21 @@ proc newGpuiFrameSource*(renderer: GpuiRenderer; root: GpuiElement;
 proc toAny*(src: GpuiFrameSource): AnyFrameSource =
   ## Wrap the GPUI source in the bridge's polymorphic `AnyFrameSource`
   ## so it can be dropped into `BridgeConfig.frameSource` alongside
-  ## the stub. Mirrors the stub's `toAny` helper.
+  ## the stub. Mirrors the stub's `toAny` helper. The label closure hands
+  ## the bridge's hello the label of this source's frames (PSZ-M3 note 21).
   let captured = src
-  newAnyFrameSource(src.width, src.height,
+  let wrapped = newAnyFrameSource(src.width, src.height,
     renderFrameImpl = proc(): Frame {.gcsafe.} =
       {.cast(gcsafe).}: captured.renderFrame(),
     closeImpl = proc() {.gcsafe.} =
       {.cast(gcsafe).}: captured.close())
+  wrapped.frameSourceLabelImpl = proc(): string {.gcsafe.} =
+    {.cast(gcsafe).}: captured.gpuiFrameSourceLabel()
+  # PSZ-M3 note 22: the label of the last frame, without rendering. The bridge
+  # reads it every tick to fail the connection when the source falls back.
+  wrapped.currentFrameSourceLabelImpl = proc(): string {.gcsafe.} =
+    {.cast(gcsafe).}: frameSourceLabelFor(captured.servedHeadless)
+  wrapped
 
 # ---------------------------------------------------------------------------
 # RS-M11b: element-tree manifest builder

@@ -53,6 +53,11 @@ just lint            # nim check + nixfmt --check
 just format          # nimpretty + nixfmt
 ```
 
+`just test` loads the GPUI and Freya renderer shims, which their own
+repositories build. Run `just rust-build` in `../isonim-gpui` and in
+`../isonim-freya` (each in its own dev shell) first; the Justfile's `_matrix`
+recipe explains how the tests then find each shim.
+
 ## Project structure
 
 ```text
@@ -66,6 +71,8 @@ src/
 tests/
   test_packet_codec_roundtrip.nim        # F/M/I codec round-trip
   test_ws_frame_codec.nim                # RFC 6455 codec round-trip
+  ws_test_client.nim                     # shared WS client for the bridge tests
+  test_ws_test_client_keeps_early_bytes.nim  # frames sent with the 101 survive
   test_bridge_hello_first.nim            # first M is hello
   test_bridge_stub_frame_source.nim      # stub gradient delivers frames
   test_bridge_input_roundtrip.nim        # client I -> server InputSink

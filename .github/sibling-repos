@@ -36,18 +36,23 @@
 # default shell has no pipefail). The list is now exactly the set of sibling
 # path switches `config.nims` declares -- keep the two in step.
 
+# AN ENTRY THAT repro.lock ALSO PINS MUST NAME THE SAME REVISION (marked
+# `= repro.lock` below). `repro build` refuses a sibling checked out at any
+# other revision ("cross-repo producer ... source revision mismatch"), so move
+# both together: `repro lock update <repo> --to=<sha>`, then edit the line here.
+
 # Core: `isonim/...` plus the transitive deps isonim re-exports.
-isonim=f39688e6d988d3622ad8575dd87792eeb022bf75  # isonim@dev tip
-nim-everywhere=749f037dd40da1d0c04f499f568dda18f7aebd1b  # nim-everywhere@dev tip
+isonim=a434f3346780f693b776351b8154ac685801ebbb  # = repro.lock
+nim-everywhere=2a41b67a6c0d41cbb55359c702f300eb2696682f  # = repro.lock
 nim-stew=83eb1157963b7f49351dbdd858355fa990bbe23c  # nim-stew@master tip
 nim-faststreams=ce27581a3e881f782f482cb66dc5b07a02bd615e  # nim-faststreams@stable tip
 
 # Renderer adapters (RS-M2/M4/M5/M6). Each adapter module imports
 # `isonim_<backend>/renderer`; the Linux scaffolds compile without the native
 # shim, which is why these are compile-time paths and not run-time deps.
-isonim-gpui=010b175d67333575385bd472425530238f89edd7  # isonim-gpui@dev tip
-isonim-freya=a8c457424a35f2d10b30073323dfd61bd81b3374  # isonim-freya@dev tip
-isonim-cocoa=137a17f6f97bda72494b843ba1cb3a422b80d395  # isonim-cocoa@dev tip
+isonim-gpui=7e34756b9ba1fb4a714a2c4130beeb371ac7f935  # = repro.lock
+isonim-freya=09ef57f527a121bf9f3dcf1ef6138d99009ecf14  # = repro.lock
+isonim-cocoa=d5733fad04f04df05e726cdc262dcd267f088a09  # = repro.lock
 # `isonim_android/renderer` lives under isonim-android/nim-lib/src, and the
 # broader package under isonim-android/src; config.nims adds both, one clone.
 isonim-android=6e9c4502bf16dd07ff99119e032380972a9506ff  # isonim-android@dev tip

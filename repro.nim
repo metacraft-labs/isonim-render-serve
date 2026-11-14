@@ -93,16 +93,37 @@
 ##      non-skipped arms.
 ##   3. Wall-clock LATENCY-BUDGET tests
 ##      (``test_element_tree_delta_budget``,
-##      ``test_webp_inprocess_encoder_budget``) — assert a per-call /
-##      per-frame time budget that is meaningless under CPU contention;
-##      running them alongside 7 other parallel edges inflates the
-##      measured median past budget (observed: 12.6 ms clean vs a >16 ms
-##      failure under load).
+##      ``test_webp_inprocess_encoder_budget``,
+##      ``test_freya_render_budget``) — assert a per-call / per-frame time
+##      budget that is meaningless under CPU contention; running them
+##      alongside 7 other parallel edges inflates the measured median past
+##      budget (observed: 12.6 ms clean vs a >16 ms failure under load).
+##
+## The pool keeps the pooled tests apart from EACH OTHER only. The
+## pure-codec / diff / codec-roundtrip / in-process-lifecycle execute
+## edges and every BUILD (compile) edge stay unpooled and parallel, and a
+## pool cannot hold those back: ``buildNimUnittest.build`` takes no pool,
+## and an action belongs to one pool at most. So the pool alone left the
+## budget tests measuring while the same ``repro test`` compiled other
+## test binaries (observed under ``repro test``: the WebP median at
+## 31-54 ms against its 16 ms bound, the Freya frame at 87 ms against
+## 50 ms).
+##
+## **Budget tests run last.** Each budget execute edge therefore also
+## depends (``after =``) on every test BUILD edge and on every execute
+## edge that is not a budget test (``measuresWallClock`` in
+## ``renderServeTestSpecs``); the pool still serialises the budget tests
+## among themselves. Within one ``repro test`` nothing else of this graph
+## runs while a budget is measured. Two consequences of expressing the
+## barrier as dependencies, which is the mechanism the build graph has
+## for it: a budget test is reported blocked, not run, when another test
+## fails, and selecting one budget test also builds and runs (or replays
+## from the action cache) the rest of the suite. Load from OUTSIDE the
+## run — other processes on a shared host — is beyond the recipe's
+## reach; CI runners do not carry it.
 ##
 ## This changes ONLY scheduling — no ``check`` / budget is skipped,
-## relaxed, or removed; every pooled test runs in full to exit 0. The
-## pure-codec / diff / codec-roundtrip / in-process-lifecycle execute
-## edges and every BUILD (compile) edge stay unpooled and parallel.
+## relaxed, or removed; every pooled test runs in full to exit 0.
 ##
 ## ---------------------------------------------------------------------
 ## SECOND PASS — sibling-dependent tests RE-ENABLED (renderer siblings
@@ -138,7 +159,8 @@
 ##   * freya: test_freya_adapter_element_tree, test_freya_adapter_real_pixels,
 ##            test_freya_adapter_streams_task_app (pooled — async server),
 ##            test_freya_input_routes_to_fireevent (pooled — async server),
-##            test_freya_render_budget (pooled — wall-clock budget).
+##            test_freya_render_budget (pooled, runs last — wall-clock
+##            budget).
 ##   * cocoa: test_cocoa_adapter_macos_only (Linux: body is
 ##            ``when defined(macosx)``-gated → the AppKit path is compiled
 ##            out, the suite runs its Linux-scaffold arms to exit 0;
@@ -176,29 +198,30 @@
 ## desync had masked). No ``check`` weakened; product ``src/`` unchanged.
 ##
 ## ---------------------------------------------------------------------
-## STILL DEFERRED — stale prebuilt renderer shim (NOT rebuildable here).
+## The renderer shims — built by their owners, not by this graph.
 ## ---------------------------------------------------------------------
 ##
-## THREE tests depend on offscreen-pixel-readback entry points
-## (``gpui_render_to_pixels`` / ``freya_render_to_pixels`` /
-## ``gpui_bump_generation``) that are present in the renderer siblings'
-## Rust SOURCES but ABSENT from the prebuilt ``rust/target/debug/
-## lib{gpui,freya}_nim_shim.so`` cdylibs this host ships. The shims are
-## built out-of-band (the dev shell carries no ``cargo`` to rebuild
-## them — same constraint the ``isonim-gpui`` / ``isonim-freya`` /
-## ``isonim-examples`` recipes document), so the adapter's headless
-## ``*_render_to_pixels`` call misses the export and falls through to the
-## synthetic raster, which paints a non-background pixel for the nil-root
-## case the test pins. This is a stale-artifact/env condition, NOT a
-## render-serve product bug (the adapter is a faithful passthrough) and
-## NOT a reprobuild bug; ``uses: "isonim-gpui"`` threads the sibling
-## SOURCE path but does not rebuild the out-of-band cdylib.
+## The GPUI and Freya adapter tests load ``libgpui_nim_shim`` and
+## ``libfreya_nim_shim``, Rust cdylibs that isonim-gpui and isonim-freya
+## build (each with ``just rust-build``, and as a ``cargo.build`` edge of
+## its own recipe). ``uses: "isonim-gpui"`` / ``uses: "isonim-freya"``
+## thread the siblings' Nim sources only: reprobuild does not build a
+## pure-Nim-source producer's other edges for a consumer, and offers no
+## way to name them as inputs here. So the shims must be built before
+## ``repro build`` / ``repro test`` runs, which both CI workflows do with
+## the owners' recipes, and a changed shim does not invalidate a cached
+## test result. Two tests that were deferred while this host carried a
+## stale prebuilt shim run again, against shims built from the pinned
+## sources:
 ##
-##     * tests/test_gpui_adapter_renderframe.nim      (nil-root → synthetic,
-##                                                     `gpui_render_to_pixels` absent)
-##     * tests/test_freya_adapter_renderframe.nim     (nil-root → synthetic,
-##                                                     `freya_render_to_pixels` absent)
-##     * tests/test_gpui_adapter_story_generation.nim (`gpui_bump_generation` absent)
+##     * tests/test_gpui_adapter_renderframe.nim
+##     * tests/test_freya_adapter_renderframe.nim
+##
+## A third stays deferred: tests/test_gpui_adapter_story_generation.nim
+## submits a headless render token, which only a shim built with
+## isonim-gpui's ``gpui-headless`` cargo feature issues. The default shim
+## the owner's ``rust-build`` produces answers ``-100`` (unavailable), so
+## the stale-token case fails against it.
 ##
 ## ---------------------------------------------------------------------
 ## STILL DEFERRED — Objective-C / AppKit toolchain absent on Linux.
@@ -228,7 +251,7 @@
 ## input of the tests that import it.
 ##
 ## **Tool provisioning.** ``defaultToolProvisioning "path"`` matches the
-## canonical recipes: the nix dev shell puts ``nim`` + ``gcc`` on
+## canonical recipes: the nix dev shell puts ``nim`` + the C compiler on
 ## ``PATH``, so the weak-local PATH resolver is the right default.
 ## Without it ``repro build`` refuses to run with "typed tool
 ## provisioning is required for uses declarations".
@@ -236,6 +259,8 @@
 import std/os
 
 import repro_project_dsl
+# ``useFlakeDevShell`` (the ``devEnv:`` activation below).
+import repro_dsl_stdlib/foreign_env
 
 # ``ct_test_nim_unittest`` supplies the ``buildNimUnittest.build(...)``
 # typed-tool used by every test BUILD edge below, and the
@@ -259,6 +284,10 @@ type
     source: string
     binary: string
     pool: string
+    measuresWallClock: bool
+      ## The test asserts a wall-clock budget. Its execute edge runs after
+      ## every other edge of the test graph (see the header, "Budget tests
+      ## run last").
 
 const serialPoolName = "isonim_render_serve.bridge-serial"
 
@@ -273,10 +302,34 @@ const serialPoolName = "isonim_render_serve.bridge-serial"
 # prebuilt sibling shim with NO ``LD_LIBRARY_PATH`` (mirrors the
 # ``isonim-examples`` / ``isonim-freya`` recipes). It is harmless on
 # binaries that never load the shim (an unused rpath entry). The shim is
-# prebuilt out-of-band — the dev shell has no ``cargo`` to rebuild it.
+# built by isonim-freya's own recipe before this graph runs (see the
+# header). ``rust/target/debug`` is where isonim-freya's ``cargo.build``
+# edge declares it; a CARGO_TARGET_DIR outside the checkout moves it, and
+# this rpath then misses it.
 const repoRoot = currentSourcePath().parentDir()
 let freyaShimRpath =
   absolutePath(repoRoot / ".." / "isonim-freya" / "rust" / "target" / "debug")
+
+# Windows has no rpath, so the ``-Wl,-rpath`` above does nothing there. The
+# Freya FFI's ``{.dynlib: "freya_nim_shim.dll".}`` is resolved by
+# ``LoadLibrary`` with the bare file name, and the standard search order
+# looks in the directory of the loading ``.exe`` first, then the
+# directories on ``PATH``
+# (https://learn.microsoft.com/en-us/windows/win32/dlls/dynamic-link-library-search-order).
+# ``isonim-freya/rust/target/debug`` is neither, so every test that loaded
+# the shim failed with "could not load: freya_nim_shim.dll" although the
+# shim had been built. The ``build:`` block copies it next to the test
+# binaries (``build/test-bin``) with a declared ``fs.copyFile`` edge, the
+# way isonim-freya stages it beside its own tests. A declared environment
+# cannot do this instead: ``extraEnv`` REPLACES a variable, so it cannot
+# prepend a directory to ``PATH``.
+#
+# The GPUI shim needs no copy: ``isonim_gpui/bindings`` bakes the absolute
+# path of ``isonim-gpui/rust/target/debug/gpui_nim_shim.dll`` into the
+# binary when that file exists at compile time, which it does once the
+# shim is built first (see the header).
+const freyaShimDll = "../isonim-freya/rust/target/debug/freya_nim_shim.dll"
+const stagedFreyaShimDll = "build/test-bin/freya_nim_shim.dll"
 
 const renderServeTestSpecs: seq[RenderServeTestSpec] = @[
   # --- Pure codec / diff / element-tree round-trips ------------------
@@ -321,16 +374,23 @@ const renderServeTestSpecs: seq[RenderServeTestSpec] = @[
   # them alongside 7 other parallel edges saturates the host and inflates
   # the measured median past budget (observed: median 12.6 ms clean vs a
   # >16 ms failure under load). They are routed through the capacity-1
-  # pool so they measure the encoder / delta cost with scheduler
-  # headroom. This changes ONLY scheduling — no budget is relaxed; the
-  # assertions run in full to exit 0.
+  # pool and run after every other edge of the test graph
+  # (``measuresWallClock``) so they measure the encoder / delta cost with
+  # scheduler headroom. This changes ONLY scheduling — no budget is
+  # relaxed; the assertions run in full to exit 0.
   RenderServeTestSpec(source: "tests/test_element_tree_delta_budget.nim",
-    binary: "build/test-bin/test_element_tree_delta_budget", pool: serialPoolName),
+    binary: "build/test-bin/test_element_tree_delta_budget", pool: serialPoolName,
+    measuresWallClock: true),
   RenderServeTestSpec(source: "tests/test_webp_inprocess_encoder_budget.nim",
-    binary: "build/test-bin/test_webp_inprocess_encoder_budget", pool: serialPoolName),
+    binary: "build/test-bin/test_webp_inprocess_encoder_budget", pool: serialPoolName,
+    measuresWallClock: true),
   # --- Subprocess / async-server tests (capacity-1 serial pool) -----
   # Bridge tests: spawn a real asynchttpserver on an ephemeral port +
   # hand-rolled WS client (import ./ws_test_client).
+  # The shared WS client's handshake, against a scripted loopback server
+  # (one listening socket on an ephemeral port, like the bridge tests).
+  RenderServeTestSpec(source: "tests/test_ws_test_client_keeps_early_bytes.nim",
+    binary: "build/test-bin/test_ws_test_client_keeps_early_bytes", pool: serialPoolName),
   RenderServeTestSpec(source: "tests/test_bridge_hello_first.nim",
     binary: "build/test-bin/test_bridge_hello_first", pool: serialPoolName),
   RenderServeTestSpec(source: "tests/test_bridge_stub_frame_source.nim",
@@ -345,6 +405,10 @@ const renderServeTestSpecs: seq[RenderServeTestSpec] = @[
     binary: "build/test-bin/test_protocol_violation_close", pool: serialPoolName),
   RenderServeTestSpec(source: "tests/test_v_packet_emission.nim",
     binary: "build/test-bin/test_v_packet_emission", pool: serialPoolName),
+  RenderServeTestSpec(source: "tests/test_bridge_hello_static_frame_source.nim",
+    binary: "build/test-bin/test_bridge_hello_static_frame_source", pool: serialPoolName),
+  RenderServeTestSpec(source: "tests/test_bridge_renderer_fell_back.nim",
+    binary: "build/test-bin/test_bridge_renderer_fell_back", pool: serialPoolName),
   # WebP tests that fork an ffmpeg child on their non-skipped arms:
   # serialized so the fork+exec runs with headroom (arms ``skip()`` when
   # ffmpeg is absent — no check weakened either way).
@@ -369,6 +433,16 @@ const renderServeTestSpecs: seq[RenderServeTestSpec] = @[
     binary: "build/test-bin/test_android_adapter_element_tree", pool: ""),
   RenderServeTestSpec(source: "tests/test_rasteriser_kind_paint.nim",
     binary: "build/test-bin/test_rasteriser_kind_paint", pool: ""),
+  # Shim-backed nil-root probes (previously deferred over a stale
+  # prebuilt shim; see the header).
+  RenderServeTestSpec(source: "tests/test_gpui_adapter_renderframe.nim",
+    binary: "build/test-bin/test_gpui_adapter_renderframe", pool: ""),
+  RenderServeTestSpec(source: "tests/test_freya_adapter_renderframe.nim",
+    binary: "build/test-bin/test_freya_adapter_renderframe", pool: ""),
+  # PSZ-M3 frame-source label in the hello (no server; its GPUI-source
+  # cases load the GPUI shim).
+  RenderServeTestSpec(source: "tests/test_hello_frame_source.nim",
+    binary: "build/test-bin/test_hello_frame_source", pool: ""),
   # Cross-compile gate tests drive a ``nim check`` subprocess (heavy
   # child compile) → serial pool so the fork+exec runs with headroom.
   RenderServeTestSpec(source: "tests/test_cocoa_adapter_compile.nim",
@@ -392,9 +466,11 @@ const renderServeTestSpecs: seq[RenderServeTestSpec] = @[
   RenderServeTestSpec(source: "tests/test_freya_input_routes_to_fireevent.nim",
     binary: "build/test-bin/test_freya_input_routes_to_fireevent", pool: serialPoolName),
   # Freya render-budget: asserts a per-frame wall-clock budget → serial
-  # pool so the measurement runs with scheduler headroom (not weakened).
+  # pool, run after every other edge (``measuresWallClock``), so the
+  # measurement runs with scheduler headroom (not weakened).
   RenderServeTestSpec(source: "tests/test_freya_render_budget.nim",
-    binary: "build/test-bin/test_freya_render_budget", pool: serialPoolName),
+    binary: "build/test-bin/test_freya_render_budget", pool: serialPoolName,
+    measuresWallClock: true),
 
   # --- Element-tree manifest/delta bridge tests (formerly RangeDefect) -
   # These spawn the async bridge server + hand-rolled WS client and drive
@@ -417,18 +493,49 @@ const renderServeTestSpecs: seq[RenderServeTestSpec] = @[
 ]
 
 package isonim_render_serve:
+  # ``repro exec`` (CI's ``dev-exec`` under ci-reprobuild.yml, which runs
+  # ``just build`` / ``just test`` through it) activates the flake's dev
+  # shell, as the isonim-gpui and isonim-freya recipes do. Those recipes
+  # need more than the ``uses:`` toolchain: ``libwebp`` on the loader path
+  # for the in-process WebP encoder, ``nim`` on PATH for the cross-compile
+  # gate tests, and ``markdownlint-cli2`` / ``nixfmt`` for ``just lint``.
+  #
+  # This does NOT reach the actions of ``repro build`` / ``repro test``:
+  # they inherit the environment ``repro`` itself was started in. Started
+  # outside the dev shell (as ci-reprobuild.yml starts them), the bridge
+  # tests fail with "could not load: libwebp.so.7" and the cross-compile
+  # gate tests with "nim: command not found"; reprobuild has no ``libwebp``
+  # package to declare here.
+  devEnv:
+    when not defined(windows):
+      useFlakeDevShell()
+
   defaultToolProvisioning "path"
 
   uses:
     # Toolchain floor — the PATH-resolvable binaries the build needs.
     # ``nim`` compiles every test binary (the ``buildNimUnittest.build``
-    # edges below) and the library facade; ``gcc`` is the C back-end
-    # ``nim c`` shells out to and links through. The lower bound mirrors
-    # the nimble file's ``requires "nim >= 2.0.0"``; ``gcc >=12`` matches
-    # the workspace toolchain floor. Sufficient for the path-mode
-    # resolver under ``nix develop``.
+    # edges below) and the library facade. The lower bound mirrors the
+    # nimble file's ``requires "nim >= 2.0.0"``. The C compiler is the
+    # back-end ``nim c`` shells out to and links through: native Nim
+    # selects Clang on Darwin and GCC elsewhere, so declare the one it
+    # actually runs. Action-scoped tool selection keeps only the compilers
+    # a recipe declares, and with ``gcc`` alone every macOS compile action
+    # failed with "clang: command not found". ``gcc >=12`` matches the
+    # workspace toolchain floor. Sufficient for the path-mode resolver
+    # under ``nix develop``.
     "nim >=2.0"
-    "gcc >=12"
+    when defined(macosx):
+      "clang"
+    else:
+      "gcc >=12"
+    # ``cargo`` and ``just`` serve ``just build`` / ``just test``, which CI
+    # runs through ``dev-exec`` in this package's environment. The test
+    # recipes ask ``cargo metadata`` (through ``../isonim-freya/tools/
+    # with_shim_path.sh``) where the Freya shim was built. Nothing here
+    # compiles Rust: each sibling builds its shim in its own environment.
+    "cargo >=1.85"
+    "just >=1"
 
     # SECOND-PASS sibling Nim-library producers (SC-11 develop-mode
     # from-source consumption). Each names a workspace PROJECT that ships
@@ -489,18 +596,31 @@ package isonim_render_serve:
     let serialPool = buildPool(serialPoolName, 1'u32)
     discard serialPool
 
-    proc emitTestPair(source, binary, pool: string;
-                      buildActions, executeActions: var seq[BuildActionDef]) =
+    # Windows only: stage the Freya shim beside the test binaries (see
+    # ``freyaShimDll`` above). Every execute edge runs after the copy and
+    # lists the staged file as a required input, so a changed shim re-runs
+    # the tests that load it.
+    var shimRuntime: seq[string] = @[]
+    var shimRuntimeAfter: seq[BuildActionDef] = @[]
+    when defined(windows):
+      shimRuntimeAfter.add(fs.copyFile(freyaShimDll, stagedFreyaShimDll,
+        actionId = "isonim_render_serve.stage_freya_shim_dll"))
+      shimRuntime.add(stagedFreyaShimDll)
+
+    proc testStem(spec: RenderServeTestSpec): string =
+      ## The basename of ``spec.binary``: the suffix of both action ids.
       var lastSlash = -1
-      for i in 0 ..< binary.len:
-        if binary[i] == '/' or binary[i] == '\\':
+      for i in 0 ..< spec.binary.len:
+        if spec.binary[i] == '/' or spec.binary[i] == '\\':
           lastSlash = i
-      let stem =
-        if lastSlash >= 0: binary[lastSlash + 1 .. ^1]
-        else: binary
-      let edge = buildNimUnittest.build(
-        source = source,
-        binary = binary,
+      if lastSlash >= 0: spec.binary[lastSlash + 1 .. ^1]
+      else: spec.binary
+
+    proc emitTestBuild(spec: RenderServeTestSpec): BuildNimUnittestBuildEdge =
+      let stem = testStem(spec)
+      result = buildNimUnittest.build(
+        source = spec.source,
+        binary = spec.binary,
         defines = @["release"],
         paths = @["src", "tests"],
         mm = "orc",
@@ -511,26 +631,46 @@ package isonim_render_serve:
         extraPassL = @["-Wl,-rpath," & freyaShimRpath],
         extraInputs = @["src"],
         actionId = "isonim_render_serve.test_build." & stem)
-      buildActions.add(edge.action)
+
+    proc emitTestExecute(spec: RenderServeTestSpec;
+                         edge: BuildNimUnittestBuildEdge;
+                         after: seq[BuildActionDef]): BuildActionDef =
+      let stem = testStem(spec)
       # ``registerImplicitName = false`` because the BUILD edge already
       # owns the binary basename as the implicit target name; the
       # explicit ``actionId`` is the execute edge's selector (two-edge
       # shape).
-      let executeEdge =
-        if pool.len > 0:
-          edge.testBinary.run(
-            actionId = "isonim_render_serve.test_execute." & stem,
-            pool = pool,
-            registerImplicitName = false)
-        else:
-          edge.testBinary.run(
-            actionId = "isonim_render_serve.test_execute." & stem,
-            registerImplicitName = false)
-      executeActions.add(executeEdge)
+      if spec.pool.len > 0:
+        edge.testBinary.run(
+          actionId = "isonim_render_serve.test_execute." & stem,
+          after = after,
+          requiredBinaries = shimRuntime,
+          pool = spec.pool,
+          registerImplicitName = false)
+      else:
+        edge.testBinary.run(
+          actionId = "isonim_render_serve.test_execute." & stem,
+          after = after,
+          requiredBinaries = shimRuntime,
+          registerImplicitName = false)
 
+    # Every BUILD edge first, then the execute edges that are not budget
+    # tests, then the budget tests, which depend on all of the above (see
+    # the header, "Budget tests run last").
+    var testEdges: seq[BuildNimUnittestBuildEdge] = @[]
     for spec in renderServeTestSpecs:
-      emitTestPair(spec.source, spec.binary, spec.pool,
-        testBuildActions, testExecuteActions)
+      let edge = emitTestBuild(spec)
+      testBuildActions.add(edge.action)
+      testEdges.add(edge)
+    for i, spec in renderServeTestSpecs:
+      if not spec.measuresWallClock:
+        testExecuteActions.add(
+          emitTestExecute(spec, testEdges[i], shimRuntimeAfter))
+    let budgetAfter = shimRuntimeAfter & testBuildActions & testExecuteActions
+    for i, spec in renderServeTestSpecs:
+      if spec.measuresWallClock:
+        testExecuteActions.add(
+          emitTestExecute(spec, testEdges[i], budgetAfter))
 
     discard collect("test", testExecuteActions)
     discard collect("test-builds", testBuildActions)

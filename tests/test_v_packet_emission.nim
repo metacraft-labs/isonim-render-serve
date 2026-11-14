@@ -38,7 +38,7 @@ proc collectFirstPackets(port: int; minF, minV: int):
     Future[tuple[hello: JsonNode, fCount: int, vCount: int,
                   firstV: VideoFrame]] {.async.} =
   let sock = await connectWs(port)
-  let state = newWsClientState()
+  let state = clientStateFor(sock)
   var hello = newJNull()
   var fCount = 0
   var vCount = 0

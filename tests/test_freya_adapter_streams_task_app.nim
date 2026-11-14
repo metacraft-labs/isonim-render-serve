@@ -62,7 +62,7 @@ suite "RS-M4: bridge streams Freya task_app frames":
 
       proc flow(): Future[seq[Frame]] {.async.} =
         let sock = await connectWs(port)
-        let state = newWsClientState()
+        let state = clientStateFor(sock)
         var frames: seq[Frame] = @[]
         var sawHello = false
         while frames.len < 5:
