@@ -355,6 +355,12 @@ type
   ConnectionState = ref object
     helloSent: bool
     closed: bool
+    closeInFlight: Future[void]
+      ## The Close frame this side is sending to fail the connection
+      ## (`failConnection`), or nil. ``closed`` is set before that frame is
+      ## written, so the other half of the connection can see ``closed`` and
+      ## return while the frame is still queued; ``bridgeOnce`` awaits this
+      ## future before it closes the socket, or the frame would be lost.
     announcedFrameSource: string
       ## PSZ-M3 note 22: the frame-source label the hello declared. A later
       ## frame whose label differs fails the connection (see `frameLoop`).
@@ -697,6 +703,27 @@ proc buildOutgoingFrame(curr: Frame; state: ConnectionState): Frame =
                width: curr.width, height: curr.height,
                rects: toDirtyRects(regions))
 
+proc failConnection(client: AsyncSocket; state: ConnectionState;
+                    code: uint16; reason: string) {.async.} =
+  ## Fail the connection with a Close frame carrying `code`, the way
+  ## RFC 6455 §7.1.7 describes: send the Close frame, then close the TCP
+  ## connection (https://www.rfc-editor.org/rfc/rfc6455#section-7.1.7).
+  ##
+  ## ``state.closed`` is set first, so the other half of the connection
+  ## stops sending: no data frame may follow a Close frame (RFC 6455
+  ## §5.5.1). That half can then return before the Close frame is written,
+  ## because a queued send completes only on a later turn of the event
+  ## loop, and its return ends ``bridgeOnce``. The future recorded in
+  ## ``state.closeInFlight`` is what ``bridgeOnce`` waits for before it
+  ## closes the socket. Without it a loaded host, where the frame loop's
+  ## timer has expired by the time the violation is read, closed the
+  ## connection with no Close frame, and the client saw a bare end of
+  ## stream instead of status 1002.
+  state.closed = true
+  let sending = sendClose(client, code, reason)
+  state.closeInFlight = sending
+  await sending
+
 proc frameLoop(client: AsyncSocket; cfg: BridgeConfig;
                state: ConnectionState) {.async.} =
   ## Push the stub source's frames at the configured cadence until
@@ -748,8 +775,8 @@ proc frameLoop(client: AsyncSocket; cfg: BridgeConfig;
     # rendered is dropped, not sent.
     if state.trackFrameSource and
        cfg.frameSource.currentFrameSourceLabelImpl() != state.announcedFrameSource:
-      await sendClose(client, rendererFellBackCloseCode, rendererFellBackReason)
-      state.closed = true
+      await failConnection(client, state, rendererFellBackCloseCode,
+                           rendererFellBackReason)
       return
 
     # ELT-M8: per-frame transport selection runs ONLY when the
@@ -1003,31 +1030,29 @@ proc handleInbound(client: AsyncSocket; cfg: BridgeConfig;
       if msg.opcode != wsOpBinary and msg.opcode != wsOpText:
         continue
       if msg.payload.len == 0:
-        state.closed = true
-        await sendClose(client, CloseProtocolError, "empty packet")
+        await failConnection(client, state, CloseProtocolError,
+                             "empty packet")
         return
       let kind = char(msg.payload[0])
       let raw = stringToBytes(msg.payload)
       case kind
       of 'F':
         # Clients MUST NOT push F packets; RS-M0 § "Error handling".
-        state.closed = true
-        await sendClose(client, CloseProtocolError, "client F packet")
+        await failConnection(client, state, CloseProtocolError,
+                             "client F packet")
         return
       of 'I':
         var ipkt: InputPacket
         try:
           ipkt = decodeInput(raw)
         except PacketProtocolError as e:
-          state.closed = true
-          await sendClose(client, CloseProtocolError, e.msg)
+          await failConnection(client, state, CloseProtocolError, e.msg)
           return
         var ev: InputEvent
         try:
           ev = decodeInputEvent(ipkt)
         except PacketProtocolError as e:
-          state.closed = true
-          await sendClose(client, CloseProtocolError, e.msg)
+          await failConnection(client, state, CloseProtocolError, e.msg)
           return
         if cfg.inputSink != nil:
           cfg.inputSink.submit(ev)
@@ -1040,8 +1065,7 @@ proc handleInbound(client: AsyncSocket; cfg: BridgeConfig;
         try:
           mpkt = decodeMeta(raw)
         except PacketProtocolError as e:
-          state.closed = true
-          await sendClose(client, CloseProtocolError, e.msg)
+          await failConnection(client, state, CloseProtocolError, e.msg)
           return
         # ETS-M2: the browser's hello-accept reply may pin the
         # ``e/element-tree`` transport. When it does, the bridge
@@ -1056,9 +1080,8 @@ proc handleInbound(client: AsyncSocket; cfg: BridgeConfig;
            helloAcceptAcceptsElementTreeDelta(mpkt.json):
           state.elementTreeDeltaAccepted = true
       else:
-        state.closed = true
-        await sendClose(client, CloseProtocolError,
-                        "unknown tag 0x" & toHex(uint8(kind), 2))
+        await failConnection(client, state, CloseProtocolError,
+                             "unknown tag 0x" & toHex(uint8(kind), 2))
         return
 
 proc bridgeOnce(client: AsyncSocket; cfg: BridgeConfig) {.async.} =
@@ -1081,6 +1104,10 @@ proc bridgeOnce(client: AsyncSocket; cfg: BridgeConfig) {.async.} =
   let inFut = handleInbound(client, cfg, state)
   await outFut or inFut
   state.closed = true
+  # Whichever half returned first, a Close frame the other half queued
+  # must reach the client before the socket closes (see `failConnection`).
+  if not state.closeInFlight.isNil:
+    await state.closeInFlight
   try: client.close() except CatchableError: discard
 
 # ---------------------------------------------------------------------------
