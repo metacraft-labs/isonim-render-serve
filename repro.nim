@@ -248,7 +248,9 @@
 ## ``tests/ws_test_client.nim`` is an IMPORTED helper (a WebSocket client
 ## used by the bridge/streaming tests via ``import ./ws_test_client``),
 ## NOT a standalone ``suite`` test — it gets no edge, only a transitive
-## input of the tests that import it.
+## input of the tests that import it. ``tests/contention_guard.nim`` is
+## another: the three budget tests import it to report a run on a
+## contended host as NOT MEASURED instead of asserting its budget.
 ##
 ## **Tool provisioning.** ``defaultToolProvisioning "path"`` matches the
 ## canonical recipes: the nix dev shell puts ``nim`` + the C compiler on

@@ -24,6 +24,20 @@
 ## render-side median under 50 ms is the necessary and sufficient
 ## condition to close the matrix's "Freya 144 ms vs 50 ms goal" gap.
 ##
+## ## When the budget is asserted
+##
+## Only when the timed loop ran on an uncontended host, as classified by
+## ``tests/contention_guard.nim``: the 1-minute load average per usable
+## CPU was at most 1.0 before and after the loop, the measuring thread
+## spent at most 5 % of the loop's wall time waiting on a run queue, and
+## its cgroup was not throttled by a CPU quota. Otherwise the test prints
+## ``NOT MEASURED`` with those readings and reports itself skipped, never
+## passed. The budget itself, and the build modes in which it is
+## asserted, are unchanged. A sleeping or blocking implementation raises
+## none of the three signals, so a genuinely slow implementation still
+## fails. Where a platform lacks a signal (only Linux has the last two;
+## Windows has no load average) the guard's header says how it decides.
+##
 ## ## Build prerequisites
 ##
 ## Compiles with ``-d:useFreyaHeadless`` so the adapter routes through
@@ -37,6 +51,8 @@ import isonim_freya/renderer
 import isonim_freya/bindings as freya_bindings
 
 import isonim_render_serve/adapters/freya_adapter
+
+import ./contention_guard
 
 proc median(xs: var seq[float]): float =
   if xs.len == 0: return 0.0
@@ -119,12 +135,14 @@ suite "EPP-M10: Freya headless render budget at Desktop viewport":
     discard fs.renderFrame()
 
     var samples = newSeq[float](Frames)
+    let probe = startContentionProbe()
     for f in 0 ..< Frames:
       let t0 = getMonoTime()
       let frame = fs.renderFrame()
       let dt = msSince(t0)
       check frame.pixels.len == Width * Height * 4
       samples[f] = dt
+    let verdict = probe.finish()
 
     let med = median(samples)
     var slowestK = samples
@@ -139,7 +157,8 @@ suite "EPP-M10: Freya headless render budget at Desktop viewport":
       # The headless path is the one EPP-M8 caught at 144 ms; this is
       # the gate that proves EPP-M10's cached TestingHandler + direct
       # Skia readback got the median under the 50 ms goal.
-      check med <= BudgetMs
+      assertBudgetUnlessContended(verdict, &"median {med:.2f} ms <= {BudgetMs} ms",
+                                  med <= BudgetMs)
     else:
       # Synthetic-fallback path. The synthetic raster runs entirely
       # in Nim memory; debug builds pay GC overhead per 5 MB seq, so
@@ -147,4 +166,6 @@ suite "EPP-M10: Freya headless render budget at Desktop viewport":
       # builds. Release builds clear the bar comfortably; debug
       # builds are gated separately.
       when defined(release):
-        check med <= BudgetMs
+        assertBudgetUnlessContended(verdict,
+                                    &"median {med:.2f} ms <= {BudgetMs} ms",
+                                    med <= BudgetMs)

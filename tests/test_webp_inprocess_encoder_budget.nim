@@ -11,10 +11,26 @@
 ## ONLY against the path the test exists to measure. The umbrella
 ## ``isWebPEncoderAvailable`` covers the subprocess case in
 ## ``test_webp_encoder_lifecycle.nim``.
+##
+## ## When the budget is asserted
+##
+## Only when the timed loop ran on an uncontended host, as classified by
+## ``tests/contention_guard.nim``: the 1-minute load average per usable
+## CPU was at most 1.0 before and after the loop, the measuring thread
+## spent at most 5 % of the loop's wall time waiting on a run queue, and
+## its cgroup was not throttled by a CPU quota. Otherwise the test prints
+## ``NOT MEASURED`` with those readings and reports itself skipped, never
+## passed. The budget itself, and the build modes in which it is
+## asserted, are unchanged. A sleeping or blocking implementation raises
+## none of the three signals, so a genuinely slow implementation still
+## fails. Where a platform lacks a signal (only Linux has the last two;
+## Windows has no load average) the guard's header says how it decides.
 
 import std/[algorithm, monotimes, strutils, times, unittest]
 
 import isonim_render_serve
+
+import ./contention_guard
 
 let inProcessAvail = isInProcessWebPEncoderAvailable()
 
@@ -86,11 +102,13 @@ suite "FUH-M5: in-process WebP encoder latency budget":
       discard encode(h, rgba)
 
       var samples: seq[float] = @[]
+      let probe = startContentionProbe()
       for i in 0 ..< Iterations:
         let t0 = getMonoTime()
         discard encode(h, rgba)
         let dt = getMonoTime() - t0
         samples.add float(inMicroseconds(dt)) / 1000.0
+      let verdict = probe.finish()
 
       let minMs = samples.min()
       let medMs = median(samples)
@@ -106,7 +124,9 @@ suite "FUH-M5: in-process WebP encoder latency budget":
       echo "  budget : ", BudgetMs, " ms (60 FPS)"
       echo ""
 
-      check medMs <= float(BudgetMs)
+      assertBudgetUnlessContended(verdict,
+        "median " & medMs.formatFloat(ffDecimal, 2) & " ms <= " & $BudgetMs &
+        " ms", medMs <= float(BudgetMs))
       destroy(h)
 
   test "median at compression_level=6 still finishes in finite time":
