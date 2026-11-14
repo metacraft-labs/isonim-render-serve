@@ -93,16 +93,37 @@
 ##      non-skipped arms.
 ##   3. Wall-clock LATENCY-BUDGET tests
 ##      (``test_element_tree_delta_budget``,
-##      ``test_webp_inprocess_encoder_budget``) — assert a per-call /
-##      per-frame time budget that is meaningless under CPU contention;
-##      running them alongside 7 other parallel edges inflates the
-##      measured median past budget (observed: 12.6 ms clean vs a >16 ms
-##      failure under load).
+##      ``test_webp_inprocess_encoder_budget``,
+##      ``test_freya_render_budget``) — assert a per-call / per-frame time
+##      budget that is meaningless under CPU contention; running them
+##      alongside 7 other parallel edges inflates the measured median past
+##      budget (observed: 12.6 ms clean vs a >16 ms failure under load).
+##
+## The pool keeps the pooled tests apart from EACH OTHER only. The
+## pure-codec / diff / codec-roundtrip / in-process-lifecycle execute
+## edges and every BUILD (compile) edge stay unpooled and parallel, and a
+## pool cannot hold those back: ``buildNimUnittest.build`` takes no pool,
+## and an action belongs to one pool at most. So the pool alone left the
+## budget tests measuring while the same ``repro test`` compiled other
+## test binaries (observed under ``repro test``: the WebP median at
+## 31-54 ms against its 16 ms bound, the Freya frame at 87 ms against
+## 50 ms).
+##
+## **Budget tests run last.** Each budget execute edge therefore also
+## depends (``after =``) on every test BUILD edge and on every execute
+## edge that is not a budget test (``measuresWallClock`` in
+## ``renderServeTestSpecs``); the pool still serialises the budget tests
+## among themselves. Within one ``repro test`` nothing else of this graph
+## runs while a budget is measured. Two consequences of expressing the
+## barrier as dependencies, which is the mechanism the build graph has
+## for it: a budget test is reported blocked, not run, when another test
+## fails, and selecting one budget test also builds and runs (or replays
+## from the action cache) the rest of the suite. Load from OUTSIDE the
+## run — other processes on a shared host — is beyond the recipe's
+## reach; CI runners do not carry it.
 ##
 ## This changes ONLY scheduling — no ``check`` / budget is skipped,
-## relaxed, or removed; every pooled test runs in full to exit 0. The
-## pure-codec / diff / codec-roundtrip / in-process-lifecycle execute
-## edges and every BUILD (compile) edge stay unpooled and parallel.
+## relaxed, or removed; every pooled test runs in full to exit 0.
 ##
 ## ---------------------------------------------------------------------
 ## SECOND PASS — sibling-dependent tests RE-ENABLED (renderer siblings
@@ -138,7 +159,8 @@
 ##   * freya: test_freya_adapter_element_tree, test_freya_adapter_real_pixels,
 ##            test_freya_adapter_streams_task_app (pooled — async server),
 ##            test_freya_input_routes_to_fireevent (pooled — async server),
-##            test_freya_render_budget (pooled — wall-clock budget).
+##            test_freya_render_budget (pooled, runs last — wall-clock
+##            budget).
 ##   * cocoa: test_cocoa_adapter_macos_only (Linux: body is
 ##            ``when defined(macosx)``-gated → the AppKit path is compiled
 ##            out, the suite runs its Linux-scaffold arms to exit 0;
@@ -262,6 +284,10 @@ type
     source: string
     binary: string
     pool: string
+    measuresWallClock: bool
+      ## The test asserts a wall-clock budget. Its execute edge runs after
+      ## every other edge of the test graph (see the header, "Budget tests
+      ## run last").
 
 const serialPoolName = "isonim_render_serve.bridge-serial"
 
@@ -348,13 +374,16 @@ const renderServeTestSpecs: seq[RenderServeTestSpec] = @[
   # them alongside 7 other parallel edges saturates the host and inflates
   # the measured median past budget (observed: median 12.6 ms clean vs a
   # >16 ms failure under load). They are routed through the capacity-1
-  # pool so they measure the encoder / delta cost with scheduler
-  # headroom. This changes ONLY scheduling — no budget is relaxed; the
-  # assertions run in full to exit 0.
+  # pool and run after every other edge of the test graph
+  # (``measuresWallClock``) so they measure the encoder / delta cost with
+  # scheduler headroom. This changes ONLY scheduling — no budget is
+  # relaxed; the assertions run in full to exit 0.
   RenderServeTestSpec(source: "tests/test_element_tree_delta_budget.nim",
-    binary: "build/test-bin/test_element_tree_delta_budget", pool: serialPoolName),
+    binary: "build/test-bin/test_element_tree_delta_budget", pool: serialPoolName,
+    measuresWallClock: true),
   RenderServeTestSpec(source: "tests/test_webp_inprocess_encoder_budget.nim",
-    binary: "build/test-bin/test_webp_inprocess_encoder_budget", pool: serialPoolName),
+    binary: "build/test-bin/test_webp_inprocess_encoder_budget", pool: serialPoolName,
+    measuresWallClock: true),
   # --- Subprocess / async-server tests (capacity-1 serial pool) -----
   # Bridge tests: spawn a real asynchttpserver on an ephemeral port +
   # hand-rolled WS client (import ./ws_test_client).
@@ -437,9 +466,11 @@ const renderServeTestSpecs: seq[RenderServeTestSpec] = @[
   RenderServeTestSpec(source: "tests/test_freya_input_routes_to_fireevent.nim",
     binary: "build/test-bin/test_freya_input_routes_to_fireevent", pool: serialPoolName),
   # Freya render-budget: asserts a per-frame wall-clock budget → serial
-  # pool so the measurement runs with scheduler headroom (not weakened).
+  # pool, run after every other edge (``measuresWallClock``), so the
+  # measurement runs with scheduler headroom (not weakened).
   RenderServeTestSpec(source: "tests/test_freya_render_budget.nim",
-    binary: "build/test-bin/test_freya_render_budget", pool: serialPoolName),
+    binary: "build/test-bin/test_freya_render_budget", pool: serialPoolName,
+    measuresWallClock: true),
 
   # --- Element-tree manifest/delta bridge tests (formerly RangeDefect) -
   # These spawn the async bridge server + hand-rolled WS client and drive
@@ -576,18 +607,20 @@ package isonim_render_serve:
         actionId = "isonim_render_serve.stage_freya_shim_dll"))
       shimRuntime.add(stagedFreyaShimDll)
 
-    proc emitTestPair(source, binary, pool: string;
-                      buildActions, executeActions: var seq[BuildActionDef]) =
+    proc testStem(spec: RenderServeTestSpec): string =
+      ## The basename of ``spec.binary``: the suffix of both action ids.
       var lastSlash = -1
-      for i in 0 ..< binary.len:
-        if binary[i] == '/' or binary[i] == '\\':
+      for i in 0 ..< spec.binary.len:
+        if spec.binary[i] == '/' or spec.binary[i] == '\\':
           lastSlash = i
-      let stem =
-        if lastSlash >= 0: binary[lastSlash + 1 .. ^1]
-        else: binary
-      let edge = buildNimUnittest.build(
-        source = source,
-        binary = binary,
+      if lastSlash >= 0: spec.binary[lastSlash + 1 .. ^1]
+      else: spec.binary
+
+    proc emitTestBuild(spec: RenderServeTestSpec): BuildNimUnittestBuildEdge =
+      let stem = testStem(spec)
+      result = buildNimUnittest.build(
+        source = spec.source,
+        binary = spec.binary,
         defines = @["release"],
         paths = @["src", "tests"],
         mm = "orc",
@@ -598,30 +631,46 @@ package isonim_render_serve:
         extraPassL = @["-Wl,-rpath," & freyaShimRpath],
         extraInputs = @["src"],
         actionId = "isonim_render_serve.test_build." & stem)
-      buildActions.add(edge.action)
+
+    proc emitTestExecute(spec: RenderServeTestSpec;
+                         edge: BuildNimUnittestBuildEdge;
+                         after: seq[BuildActionDef]): BuildActionDef =
+      let stem = testStem(spec)
       # ``registerImplicitName = false`` because the BUILD edge already
       # owns the binary basename as the implicit target name; the
       # explicit ``actionId`` is the execute edge's selector (two-edge
       # shape).
-      let executeEdge =
-        if pool.len > 0:
-          edge.testBinary.run(
-            actionId = "isonim_render_serve.test_execute." & stem,
-            after = shimRuntimeAfter,
-            requiredBinaries = shimRuntime,
-            pool = pool,
-            registerImplicitName = false)
-        else:
-          edge.testBinary.run(
-            actionId = "isonim_render_serve.test_execute." & stem,
-            after = shimRuntimeAfter,
-            requiredBinaries = shimRuntime,
-            registerImplicitName = false)
-      executeActions.add(executeEdge)
+      if spec.pool.len > 0:
+        edge.testBinary.run(
+          actionId = "isonim_render_serve.test_execute." & stem,
+          after = after,
+          requiredBinaries = shimRuntime,
+          pool = spec.pool,
+          registerImplicitName = false)
+      else:
+        edge.testBinary.run(
+          actionId = "isonim_render_serve.test_execute." & stem,
+          after = after,
+          requiredBinaries = shimRuntime,
+          registerImplicitName = false)
 
+    # Every BUILD edge first, then the execute edges that are not budget
+    # tests, then the budget tests, which depend on all of the above (see
+    # the header, "Budget tests run last").
+    var testEdges: seq[BuildNimUnittestBuildEdge] = @[]
     for spec in renderServeTestSpecs:
-      emitTestPair(spec.source, spec.binary, spec.pool,
-        testBuildActions, testExecuteActions)
+      let edge = emitTestBuild(spec)
+      testBuildActions.add(edge.action)
+      testEdges.add(edge)
+    for i, spec in renderServeTestSpecs:
+      if not spec.measuresWallClock:
+        testExecuteActions.add(
+          emitTestExecute(spec, testEdges[i], shimRuntimeAfter))
+    let budgetAfter = shimRuntimeAfter & testBuildActions & testExecuteActions
+    for i, spec in renderServeTestSpecs:
+      if spec.measuresWallClock:
+        testExecuteActions.add(
+          emitTestExecute(spec, testEdges[i], budgetAfter))
 
     discard collect("test", testExecuteActions)
     discard collect("test-builds", testBuildActions)
