@@ -28,7 +28,8 @@
 ##    (``tests/e2e/test_async_streaming.nim``): ``getloadavg(3)`` divided
 ##    by the CPUs. Here the CPU count is the smallest of the online CPUs,
 ##    the CPUs this process may run on (``sched_getaffinity(2)``, read from
-##    ``/proc/self/status``) and the cgroup v2 ``cpu.max`` quota, so a
+##    ``/proc/self/status``) and the cgroup CPU quota (v2 ``cpu.max``, or
+##    v1 ``cpu.cfs_quota_us`` / ``cpu.cfs_period_us``), so a
 ##    process confined to fewer CPUs is never judged against CPUs it
 ##    cannot use. Load average counts runnable and uninterruptible tasks
 ##    host-wide (https://www.kernel.org/doc/html/latest/filesystems/proc.html,
@@ -40,26 +41,40 @@
 ##    (https://www.kernel.org/doc/html/latest/scheduler/sched-stats.html).
 ##    This is what CPU-weight starvation, a shared cpuset or quota
 ##    throttling does to the measured thread, whatever the host-wide load.
-## 3. **CFS throttling (Linux, cgroup v2).** The process's cgroup or one of
-##    its ancestors was throttled by its ``cpu.max`` quota during the loop
-##    (``nr_throttled`` in ``cpu.stat``,
-##    https://docs.kernel.org/admin-guide/cgroup-v2.html#cpu-interface-files).
+##    The reading counts only if the thread's on-CPU time (the first
+##    field) rose across the loop: with ``sched_info`` disabled the kernel
+##    reports ``0 0 0``, which would otherwise read as zero wait.
+## 3. **CFS throttling (Linux).** The process's cgroup or one of its
+##    ancestors was throttled by its CPU quota during the loop
+##    (``nr_throttled`` in ``cpu.stat``). The cgroup v2 hierarchy is tried
+##    first (https://docs.kernel.org/admin-guide/cgroup-v2.html#cpu-interface-files),
+##    then the cgroup v1 ``cpu`` controller
+##    (https://docs.kernel.org/scheduler/sched-bwc.html#statistics), each
+##    located through ``/proc/self/cgroup`` and ``/proc/self/mountinfo``.
 ##    Load average does not show quota throttling at all.
 ##
 ## Raw CPU time against wall time is deliberately **not** a criterion. A
 ## measured operation that sleeps or blocks -- the defect a budget exists
 ## to catch -- also makes wall time exceed CPU time, so that test would
-## classify a genuinely slow implementation as contended. A sleeping
-## thread is neither running nor waiting on a run queue, so it raises none
-## of the three signals above, and its budget is asserted and fails.
+## classify a genuinely slow implementation as contended. Sleeping is not
+## free of the signals, though: every wakeup puts the thread back on a run
+## queue before it runs, and that wait is counted (about 110-135 us per
+## sleep, measured on a loaded Linux host). So a regression that blocks in
+## many short sleeps, on a host already near a threshold, can come out
+## ``NOT MEASURED`` rather than ``FAILED``. It can never come out as a
+## pass: a contended sample is reported as skipped, and an uncontended one
+## asserts the budget.
 ##
 ## Evidence that cannot be read counts as contended (as an unreadable load
 ## does in the ngx guard): an unknown host is never taken for an idle one.
-## The exception is a signal the platform does not have at all, which is
-## reported as ``n/a`` and does not decide the verdict: the schedstat and
-## cgroup signals exist only on Linux, and Windows has no load average, so
-## on Windows the budget is asserted unconditionally, as it was before
-## this guard existed.
+## On Linux that includes a cgroup with no readable ``nr_throttled`` in
+## either hierarchy (no cpu controller, or a container whose
+## ``/sys/fs/cgroup`` does not show its own cgroup) and a schedstat whose
+## on-CPU time did not move. The exception is a signal the platform does
+## not have at all, which is reported as ``n/a`` and does not decide the
+## verdict: the schedstat and cgroup signals exist only on Linux, and
+## Windows has no load average, so on Windows the budget is asserted
+## unconditionally, as it was before this guard existed.
 
 import std/[cpuinfo, monotimes, os, strformat, strutils, times, unittest]
 
@@ -105,36 +120,107 @@ proc parseCpuList(list: string): int =
     except ValueError:
       return 0
 
-proc cgroupDirs(): seq[string] =
-  ## The process's cgroup v2 directory and each of its ancestors up to the
-  ## root, innermost first. Empty off Linux or without a unified hierarchy.
-  ## The root is included because inside a container's cgroup namespace it
-  ## is the container's own cgroup, where a container CPU quota lives; on a
-  ## host the root has neither ``cpu.max`` nor ``nr_throttled``.
+type
+  CgroupChains = object
+    ## The process's cgroup directories, innermost first, each followed by
+    ## its ancestors up to the root of the mounted hierarchy. The root is
+    ## included because inside a container's cgroup namespace it is the
+    ## container's own cgroup, where a container CPU quota lives.
+    v2: seq[string]   ## unified hierarchy
+    v1cpu: seq[string] ## cgroup v1 hierarchy carrying the ``cpu`` controller
+
+proc unescapeMountField(field: string): string =
+  ## ``/proc/self/mountinfo`` writes space, tab, newline and backslash in
+  ## paths as three-digit octal escapes (``\040``).
+  var i = 0
+  while i < field.len:
+    if field[i] == '\\' and i + 3 <= field.high and
+        field[i+1] in {'0'..'7'} and field[i+2] in {'0'..'7'} and
+        field[i+3] in {'0'..'7'}:
+      result.add char((ord(field[i+1]) - ord('0')) * 64 +
+                      (ord(field[i+2]) - ord('0')) * 8 +
+                      (ord(field[i+3]) - ord('0')))
+      i += 4
+    else:
+      result.add field[i]
+      inc i
+
+proc cgroupMount(fsType: string; option: string): tuple[found: bool;
+    root, mountPoint: string] =
+  ## The first mount of ``fsType`` (``cgroup2`` or ``cgroup``) whose super
+  ## options contain ``option`` (empty: any), from ``/proc/self/mountinfo``
+  ## (https://docs.kernel.org/filesystems/proc.html#proc-pid-mountinfo-information-about-mounts).
+  ## ``root`` is the cgroup path that the mount point shows.
+  try:
+    for line in readFile("/proc/self/mountinfo").splitLines():
+      let halves = line.split(" - ", 1)
+      if halves.len != 2: continue
+      let pre = halves[0].splitWhitespace()
+      let post = halves[1].splitWhitespace()
+      if pre.len < 5 or post.len < 3 or post[0] != fsType: continue
+      if option.len > 0 and option notin post[2].split(','): continue
+      return (true, unescapeMountField(pre[3]), unescapeMountField(pre[4]))
+  except IOError, OSError:
+    discard
+
+proc chainUnder(mountPoint, mountRoot, cgroupPath: string): seq[string] =
+  ## ``cgroupPath`` (as ``/proc/self/cgroup`` gives it) and its ancestors,
+  ## as directories under ``mountPoint``, stopping at the mount's root.
+  ## Empty when the cgroup is not visible under this mount.
+  var rel = cgroupPath
+  let root = if mountRoot == "/": "" else: mountRoot
+  if root.len > 0:
+    if rel == root: rel = "/"
+    elif rel.startsWith(root & "/"): rel = rel[root.len .. ^1]
+    else: return
+  while true:
+    result.add(mountPoint & (if rel == "/": "" else: rel))
+    if rel.len <= 1: break
+    rel = rel.parentDir()
+
+proc cgroupChains(): CgroupChains =
+  ## Resolves the process's own cgroups from ``/proc/self/cgroup``
+  ## (https://man7.org/linux/man-pages/man7/cgroups.7.html,
+  ## "/proc/[pid]/cgroup").
+  ## Empty off Linux.
   when defined(linux):
     try:
       for line in readFile("/proc/self/cgroup").splitLines():
-        if line.startsWith("0::"):
-          var rel = line[3 .. ^1]
-          while true:
-            result.add("/sys/fs/cgroup" & (if rel == "/": "" else: rel))
-            if rel.len <= 1: break
-            rel = rel.parentDir()
+        let f = line.split(':', 2)
+        if f.len != 3: continue
+        if f[0] == "0" and f[1] == "":
+          var m = cgroupMount("cgroup2", "")
+          if not m.found: m = (true, "/", "/sys/fs/cgroup")
+          result.v2 = chainUnder(m.mountPoint, m.root, f[2])
+        elif "cpu" in f[1].split(','):
+          let m = cgroupMount("cgroup", "cpu")
+          if m.found:
+            result.v1cpu = chainUnder(m.mountPoint, m.root, f[2])
     except IOError, OSError:
       discard
 
-proc quotaCpus(dirs: seq[string]): float =
-  ## The tightest cgroup ``cpu.max`` quota in CPUs; +inf when none is set.
+proc quotaCpus(chains: CgroupChains): float =
+  ## The tightest cgroup CPU quota in CPUs, over the v2 ``cpu.max`` and the
+  ## v1 ``cpu.cfs_quota_us`` / ``cpu.cfs_period_us`` chains; +inf when none
+  ## is set.
   result = Inf
-  for d in dirs:
+  for d in chains.v2:
     try:
       let fields = readFile(d / "cpu.max").splitWhitespace()
       if fields.len == 2 and fields[0] != "max":
         result = min(result, parseFloat(fields[0]) / parseFloat(fields[1]))
     except IOError, OSError, ValueError:
       discard
+  for d in chains.v1cpu:
+    try:
+      let quota = parseFloat(readFile(d / "cpu.cfs_quota_us").strip())
+      let period = parseFloat(readFile(d / "cpu.cfs_period_us").strip())
+      if quota > 0 and period > 0:   # -1 means no quota
+        result = min(result, quota / period)
+    except IOError, OSError, ValueError:
+      discard
 
-proc availableCpus(): float =
+proc availableCpus(chains: CgroupChains): float =
   ## The CPUs this process can actually use: online CPUs, narrowed by its
   ## affinity mask and by any cgroup CPU quota. At least 1.
   result = float(max(1, countProcessors()))
@@ -146,7 +232,7 @@ proc availableCpus(): float =
           if n > 0: result = min(result, float(n))
     except IOError, OSError:
       discard
-    result = min(result, quotaCpus(cgroupDirs()))
+    result = min(result, quotaCpus(chains))
   result = max(1.0, result)
 
 type
@@ -160,9 +246,10 @@ type
     loadBefore: float
     cpus: float
     sched: ThreadSched
-    throttled: int64     ## sum of ``nr_throttled`` over the cgroup chain
+    throttled: int64     ## sum of ``nr_throttled`` over ``throttleDirs``
     throttledKnown: bool
-    cgroups: seq[string]
+    throttleSource: string ## "cgroup v2" or "cgroup v1"
+    throttleDirs: seq[string]
 
   ContentionVerdict* = object
     ## Whether the loop between ``startContentionProbe`` and ``finish``
@@ -195,12 +282,19 @@ proc readThrottled(dirs: seq[string]): tuple[known: bool; count: int64] =
 
 proc startContentionProbe*(): ContentionProbe =
   ## Takes the "before" readings. Call it immediately before the timed loop.
-  result.cgroups = cgroupDirs()
-  result.cpus = availableCpus()
+  let chains = cgroupChains()
+  result.cpus = availableCpus(chains)
   result.loadBefore = loadAverage1()
-  let t = readThrottled(result.cgroups)
-  result.throttledKnown = t.known
-  result.throttled = t.count
+  # The unified hierarchy decides when it carries the cpu controller; a
+  # hybrid host leaves it without one, and then the v1 cpu hierarchy does.
+  for (source, dirs) in [("cgroup v2", chains.v2), ("cgroup v1", chains.v1cpu)]:
+    let t = readThrottled(dirs)
+    if t.known:
+      result.throttledKnown = true
+      result.throttled = t.count
+      result.throttleSource = source
+      result.throttleDirs = dirs
+      break
   result.sched = readThreadSched()
   result.startWall = getMonoTime()
 
@@ -210,7 +304,7 @@ proc finish*(probe: ContentionProbe): ContentionVerdict =
   let wallNs = inNanoseconds(getMonoTime() - probe.startWall)
   let sched = readThreadSched()
   let loadAfter = loadAverage1()
-  let t = readThrottled(probe.cgroups)
+  let t = readThrottled(probe.throttleDirs)
 
   var reasons: seq[string]
   let load = max(probe.loadBefore, loadAfter)
@@ -225,9 +319,11 @@ proc finish*(probe: ContentionProbe): ContentionVerdict =
 
   var schedText = "run-queue wait n/a"
   when defined(linux):
-    if probe.sched.known and sched.known and wallNs > 0:
+    # On-CPU time that did not rise means the counters are not being kept
+    # (sched_info disabled reads "0 0 0"), so zero wait proves nothing.
+    let runNs = sched.runNs - probe.sched.runNs
+    if probe.sched.known and sched.known and wallNs > 0 and runNs > 0:
       let waitNs = sched.waitNs - probe.sched.waitNs
-      let runNs = sched.runNs - probe.sched.runNs
       let waitFrac = float(waitNs) / float(wallNs)
       schedText = &"run-queue wait {float(waitNs) / 1e6:.2f} ms = " &
         &"{waitFrac * 100:.1f}% of {float(wallNs) / 1e6:.1f} ms wall " &
@@ -240,11 +336,15 @@ proc finish*(probe: ContentionProbe): ContentionVerdict =
       reasons.add "run-queue wait unreadable"
 
   var throttleText = "cgroup throttling n/a"
-  if probe.throttledKnown and t.known:
-    let periods = t.count - probe.throttled
-    throttleText = &"cgroup throttled periods {periods}"
-    if periods > 0:
-      reasons.add &"cgroup CPU quota throttled {periods} periods"
+  when defined(linux):
+    if probe.throttledKnown and t.known:
+      let periods = t.count - probe.throttled
+      throttleText = &"{probe.throttleSource} throttled periods {periods}"
+      if periods > 0:
+        reasons.add &"cgroup CPU quota throttled {periods} periods"
+    else:
+      throttleText = "cgroup throttling unreadable"
+      reasons.add "cgroup throttling unreadable"
 
   result.contended = reasons.len > 0
   result.evidence = &"{loadText}; {schedText}; {throttleText}"
