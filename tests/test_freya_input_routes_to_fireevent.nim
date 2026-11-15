@@ -71,7 +71,7 @@ suite "RS-M4: Freya input adapter routes WS clicks to fireEvent":
 
       proc flow() {.async.} =
         let sock = await connectWs(port)
-        let state = newWsClientState()
+        let state = clientStateFor(sock)
         # Wait for hello so we know the bridge is alive.
         let hello = await recvOneMessage(sock, state)
         doAssert hello.complete
@@ -128,7 +128,7 @@ suite "RS-M4: Freya input adapter routes WS clicks to fireEvent":
 
       proc flow() {.async.} =
         let sock = await connectWs(port)
-        let state = newWsClientState()
+        let state = clientStateFor(sock)
         let hello = await recvOneMessage(sock, state)
         doAssert hello.complete
         let ev = InputEvent(kind: iekKey, keyAction: kaDown,

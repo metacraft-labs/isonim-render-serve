@@ -8,7 +8,7 @@ alias fmt := format
 src-paths := "--path:src --path:tests"
 nim-flags := "--styleCheck:usages --styleCheck:error"
 
-tests := "tests/test_packet_codec_roundtrip.nim tests/test_ws_frame_codec.nim tests/test_bridge_hello_first.nim tests/test_bridge_stub_frame_source.nim tests/test_bridge_input_roundtrip.nim tests/test_protocol_violation_close.nim tests/test_gpui_adapter_renderframe.nim tests/test_gpui_adapter_streams_task_app.nim tests/test_gpui_input_routes_to_fireevent.nim tests/test_diff_region_encoder.nim tests/test_bridge_diff_streaming.nim tests/test_browser_diff_decoder.nim tests/test_freya_adapter_renderframe.nim tests/test_freya_adapter_streams_task_app.nim tests/test_freya_input_routes_to_fireevent.nim tests/test_freya_render_budget.nim tests/test_cocoa_adapter_compile.nim tests/test_cocoa_adapter_macos_only.nim tests/test_android_adapter_compile.nim tests/test_nimcache_is_worktree_local.nim"
+tests := "tests/test_packet_codec_roundtrip.nim tests/test_ws_frame_codec.nim tests/test_ws_test_client_keeps_early_bytes.nim tests/test_bridge_hello_first.nim tests/test_bridge_stub_frame_source.nim tests/test_bridge_input_roundtrip.nim tests/test_protocol_violation_close.nim tests/test_gpui_adapter_renderframe.nim tests/test_gpui_adapter_streams_task_app.nim tests/test_gpui_input_routes_to_fireevent.nim tests/test_diff_region_encoder.nim tests/test_bridge_diff_streaming.nim tests/test_browser_diff_decoder.nim tests/test_freya_adapter_renderframe.nim tests/test_freya_adapter_streams_task_app.nim tests/test_freya_input_routes_to_fireevent.nim tests/test_freya_render_budget.nim tests/test_cocoa_adapter_compile.nim tests/test_cocoa_adapter_macos_only.nim tests/test_android_adapter_compile.nim tests/test_nimcache_is_worktree_local.nim"
 
 build:
     @mkdir -p test-logs
@@ -30,7 +30,12 @@ test-unit:
           -r $t 2>&1 | tee -a test-logs/test-unit.log; \
     done
 
+# The integration tests load the GPUI and Freya renderer shims; see
+# `_matrix` for how each shim is found.
 test-integration:
+    ../isonim-freya/tools/with_shim_path.sh just _test-integration
+
+_test-integration:
     @mkdir -p test-logs
     @for t in tests/test_bridge_hello_first.nim tests/test_bridge_stub_frame_source.nim tests/test_bridge_input_roundtrip.nim tests/test_protocol_violation_close.nim tests/test_gpui_adapter_renderframe.nim tests/test_gpui_adapter_streams_task_app.nim tests/test_gpui_input_routes_to_fireevent.nim tests/test_bridge_diff_streaming.nim tests/test_freya_adapter_renderframe.nim tests/test_freya_adapter_streams_task_app.nim tests/test_freya_input_routes_to_fireevent.nim; do \
       echo "[integration] $t"; \
@@ -53,7 +58,26 @@ test-threads-off:
 
 test-all: test-orc test-arc test-refc test-threads-off
 
+# The tests load two Rust cdylibs that this repository does not build: the
+# GPUI shim (isonim-gpui) and the Freya shim (isonim-freya). Build each with
+# its owner's recipe first: `just rust-build` in ../isonim-gpui and in
+# ../isonim-freya. Each shim is then found the way its owner provides:
+#
+# * Freya: `isonim_freya/bindings` loads `libfreya_nim_shim` by bare soname.
+#   `../isonim-freya/tools/with_shim_path.sh` asks cargo where it built it
+#   (honouring CARGO_TARGET_DIR) and puts that directory on the loader path.
+#   It needs `cargo` on PATH, which the dev shell provides.
+# * GPUI: `isonim_gpui/bindings` bakes the absolute path of
+#   ../isonim-gpui/rust/target/debug/libgpui_nim_shim.so into the binary when
+#   that file exists at compile time, and falls back to the bare soname. With
+#   CARGO_TARGET_DIR set the fallback applies, and the soname resolves only
+#   because the loader path above also holds the GPUI shim when both siblings
+#   share one absolute CARGO_TARGET_DIR. isonim-gpui has no locator of its own
+#   yet.
 _matrix mm mode threads:
+    ../isonim-freya/tools/with_shim_path.sh just _matrix-run {{mm}} {{mode}} {{threads}}
+
+_matrix-run mm mode threads:
     @mkdir -p test-logs
     @for t in {{tests}}; do \
       echo "[{{mm}}/{{mode}}/threads:{{threads}}] $t"; \
@@ -75,12 +99,25 @@ lint-nim:
 lint-nix:
     nixfmt --check flake.nix
 
+# Lint every tracked Markdown document. A finding fails the recipe, and so does
+# a missing markdownlint-cli2 (the dev shell provides it): a lint that cannot
+# run must not report success.
 lint-markdown:
-    @if command -v markdownlint-cli2 >/dev/null 2>&1; then \
-      markdownlint-cli2 "**/*.md" "#**/node_modules/**" "#test-logs/**" || true; \
-    else \
-      echo "markdownlint-cli2 not available; skipping"; \
+    #!/usr/bin/env bash
+    set -euo pipefail
+    command -v markdownlint-cli2 >/dev/null
+    inventory=$(mktemp)
+    trap 'rm -f "$inventory"' EXIT
+    git ls-files -z -- '*.md' > "$inventory"
+    documents=()
+    while IFS= read -r -d '' document; do
+      documents+=("$document")
+    done < "$inventory"
+    if (( ${#documents[@]} == 0 )); then
+      echo "No tracked Markdown documents" >&2
+      exit 1
     fi
+    markdownlint-cli2 "${documents[@]}"
 
 format: format-nim format-nix
 
@@ -105,3 +142,8 @@ bench-quick:
 
 clean:
     rm -rf test-logs nim-cache
+
+# Entering the dev shell from another git repository must write nothing there.
+# Runs `nix develop`, so it is not part of the in-shell test recipes.
+test-dev-shell:
+    bash tests/test_dev_shell_writes_nothing_elsewhere.sh

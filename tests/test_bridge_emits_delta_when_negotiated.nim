@@ -138,7 +138,7 @@ suite "ETS-M2 Part B: bridge emits delta when negotiated":
 
       proc flow(): Future[string] {.async.} =
         let sock = await connectWs(port)
-        let state = newWsClientState()
+        let state = clientStateFor(sock)
         let msg = await recvOneMessage(sock, state)
         sock.close()
         return msg.payload
@@ -171,7 +171,7 @@ suite "ETS-M2 Part B: bridge emits delta when negotiated":
 
       proc flow(): Future[string] {.async.} =
         let sock = await connectWs(port)
-        let state = newWsClientState()
+        let state = clientStateFor(sock)
         let msg = await recvOneMessage(sock, state)
         sock.close()
         return msg.payload

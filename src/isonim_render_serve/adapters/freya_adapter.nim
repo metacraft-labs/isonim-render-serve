@@ -309,19 +309,37 @@ proc fillRect(pixels: var seq[byte]; w, h: int; r: Rect) =
   let x1 = min(w, r.x + r.w)
   let y1 = min(h, r.y + r.h)
   if x1 <= x0 or y1 <= y0: return
+  # This loop is the synthetic raster's whole cost: the nested layout
+  # rectangles cover the frame several times over, so at 1440x900 it
+  # blends tens of millions of bytes per frame. Indexing the `var seq`
+  # byte by byte paid a bounds check per access, and under `--mm:refc`
+  # (where the seq is reached through an extra indirection that the C
+  # compiler reloads after every store) that kept the median frame at
+  # the 50 ms budget `tests/test_freya_render_budget.nim` enforces.
+  #
+  # The clamps above put every offset the loop touches inside
+  # `[0, w * h * 4)`, so one length check here covers all of them and
+  # the loop can go through an unchecked view of the same storage.
+  if pixels.len < w * h * 4:
+    raise newException(ValueError,
+      "fillRect: pixel buffer holds " & $pixels.len &
+      " bytes, a " & $w & "x" & $h & " RGBA frame needs " & $(w * h * 4))
+  let buf = cast[ptr UncheckedArray[byte]](addr pixels[0])
   # Source-over alpha blend: out = src + dst * (1 - srcAlpha/255).
+  # Each channel is (src * a + dst * (255 - a)) div 255, at most
+  # (255 * 255) div 255 = 255, so the result always fits a byte.
   let aFrac = int(r.a)
+  let inv = 255 - aFrac
+  let sr = int(r.r) * aFrac
+  let sg = int(r.g) * aFrac
+  let sb = int(r.b) * aFrac
   for y in y0 ..< y1:
     var off = (y * w + x0) * 4
     for _ in x0 ..< x1:
-      let dr = int(pixels[off])
-      let dg = int(pixels[off + 1])
-      let db = int(pixels[off + 2])
-      let inv = 255 - aFrac
-      pixels[off] = uint8(min(255, (int(r.r) * aFrac + dr * inv) div 255))
-      pixels[off + 1] = uint8(min(255, (int(r.g) * aFrac + dg * inv) div 255))
-      pixels[off + 2] = uint8(min(255, (int(r.b) * aFrac + db * inv) div 255))
-      pixels[off + 3] = 0xFF'u8
+      buf[off] = uint8((sr + int(buf[off]) * inv) div 255)
+      buf[off + 1] = uint8((sg + int(buf[off + 1]) * inv) div 255)
+      buf[off + 2] = uint8((sb + int(buf[off + 2]) * inv) div 255)
+      buf[off + 3] = 0xFF'u8
       off += 4
 
 proc renderSyntheticFrame(src: FreyaFrameSource): Frame

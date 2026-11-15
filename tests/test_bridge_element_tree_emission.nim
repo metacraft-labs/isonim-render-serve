@@ -262,7 +262,7 @@ suite "RS-M11: bridge element-tree emission":
 
       proc flow(): Future[string] {.async.} =
         let sock = await connectWs(port)
-        let state = newWsClientState()
+        let state = clientStateFor(sock)
         let msg = await recvOneMessage(sock, state)
         sock.close()
         return msg.payload

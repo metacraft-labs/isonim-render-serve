@@ -72,6 +72,27 @@ jobs:
           env-flavor: reprobuild
           gh-token: ${{ steps.ci_token.outputs.token }}
 
+      - name: Build the renderer shims with their owners' recipes
+        # The tests load the GPUI and Freya renderer shims, Rust cdylibs owned
+        # by isonim-gpui and isonim-freya, and each is built here with its
+        # owner's own `just rust-build`, in its owner's environment:
+        # `repro exec .` started in the sibling activates that sibling's
+        # recipe (its flake dev shell and Rust toolchain). `dev-exec` would
+        # not do: it runs commands in THIS repository's environment, whose
+        # cargo is too old for isonim-gpui's dependencies ("use of unstable
+        # library feature `cold_path`").
+        #
+        # Two things rule out doing it inside `repro build` for now. A `uses:`
+        # of a sibling threads its Nim sources only and never builds its other
+        # edges, so the siblings' `cargo.build` edges cannot be inputs of the
+        # tests here. And an owner's own `repro build` is refused in this
+        # workspace: each sibling's repro.lock pins `isonim` at another revision
+        # than this repository's lock does ("cross-repo producer ... source
+        # revision mismatch").
+        run: |
+          (cd ../isonim-gpui && repro exec . -- just rust-build)
+          (cd ../isonim-freya && repro exec . -- just rust-build)
+
       - name: repro build
         # Builds the conventional `build` collection declared in
         # `repro.nim`. Verifies the primary shipping artefact (the

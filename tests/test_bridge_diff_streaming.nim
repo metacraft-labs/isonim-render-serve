@@ -78,7 +78,7 @@ suite "RS-M3: bridge diff streaming":
 
       proc flow(): Future[seq[Frame]] {.async.} =
         let sock = await connectWs(port)
-        let state = newWsClientState()
+        let state = clientStateFor(sock)
         var frames: seq[Frame] = @[]
         var sawHello = false
         while frames.len < 2:
@@ -150,7 +150,7 @@ suite "RS-M3: bridge diff streaming":
 
       proc flow(): Future[seq[Frame]] {.async.} =
         let sock = await connectWs(port)
-        let state = newWsClientState()
+        let state = clientStateFor(sock)
         var frames: seq[Frame] = @[]
         var sawHello = false
         while frames.len < 2:

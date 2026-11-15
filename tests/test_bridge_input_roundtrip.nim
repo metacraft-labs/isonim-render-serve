@@ -31,7 +31,7 @@ suite "isonim-render-serve: I packet round-trip":
       proc flow() {.async.} =
         let sock = await connectWs(port)
         # Wait for hello so we know the bridge is alive.
-        let state = newWsClientState()
+        let state = clientStateFor(sock)
         let hello = await recvOneMessage(sock, state)
         doAssert hello.complete
         # Construct a mouse click I packet via the encoder.
@@ -82,7 +82,7 @@ suite "isonim-render-serve: I packet round-trip":
 
       proc flow() {.async.} =
         let sock = await connectWs(port)
-        let state = newWsClientState()
+        let state = clientStateFor(sock)
         let hello = await recvOneMessage(sock, state)
         doAssert hello.complete
         for ev in events:

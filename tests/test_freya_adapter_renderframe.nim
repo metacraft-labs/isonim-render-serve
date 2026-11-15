@@ -87,10 +87,17 @@ suite "RS-M4: FreyaFrameSource.renderFrame (direct)":
     let fs = newFreyaFrameSource(r, nil, width = 16, height = 16)
     let frame = fs.renderFrame()
     check frame.pixels.len == 16 * 16 * 4
-    # Background-only: every RGB triplet == (0x18, 0x18, 0x18).
+    # Background-only above the identifier band: every RGB triplet in
+    # the top `16 - 2` rows == (0x18, 0x18, 0x18). Since 1a85c04 the
+    # adapter always paints a 2-row Freya purple band over the bottom
+    # `min(2, height)` rows (applied after the tree raster in
+    # `freya_adapter.renderFrame`), even for a nil root, so those rows are checked
+    # separately below rather than skipped.
+    const bandRows = 2
+    let bandStart = (16 - bandRows) * 16 * 4
     var bgOnly = true
     var i = 0
-    while i < frame.pixels.len:
+    while i < bandStart:
       if frame.pixels[i] != 0x18'u8 or
          frame.pixels[i + 1] != 0x18'u8 or
          frame.pixels[i + 2] != 0x18'u8:
@@ -98,6 +105,19 @@ suite "RS-M4: FreyaFrameSource.renderFrame (direct)":
         break
       i += 4
     check bgOnly
+    # The band itself: every pixel of the bottom two rows is exactly the
+    # backend identifier colour, fully opaque.
+    var bandExact = true
+    i = bandStart
+    while i < frame.pixels.len:
+      if frame.pixels[i] != 0x75'u8 or
+         frame.pixels[i + 1] != 0x50'u8 or
+         frame.pixels[i + 2] != 0x7B'u8 or
+         frame.pixels[i + 3] != 0xFF'u8:
+        bandExact = false
+        break
+      i += 4
+    check bandExact
 
   test "mutating the tree changes the rendered pixels":
     freya_reset_tree()

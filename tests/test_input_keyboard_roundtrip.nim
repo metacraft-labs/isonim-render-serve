@@ -131,7 +131,7 @@ suite "EPP-M7: keyboard event schema + bridge dispatch":
 
       proc flow() {.async.} =
         let sock = await connectWs(port)
-        let state = newWsClientState()
+        let state = clientStateFor(sock)
         let hello = await recvOneMessage(sock, state)
         doAssert hello.complete
         # Build a keyboard I packet via the canonical encoder so the

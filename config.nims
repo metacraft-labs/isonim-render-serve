@@ -24,18 +24,15 @@ switch("path", "$config/../nim-stew")
 switch("path", "$config/../nim-faststreams")
 
 # RS-M2: GPUI streaming adapter pulls `isonim_gpui/renderer`. The
-# renderer FFI loads `libgpui_nim_shim.so` at run time via `dynlib`;
-# the `LD_LIBRARY_PATH` (or a copy of the shared object next to the
-# binary) must point at `../isonim-gpui/rust/target/debug` for the
-# RS-M2 integration tests to actually run. Compile-time resolution
-# only needs the path switch below — the flake's shellHook extends
-# `LD_LIBRARY_PATH` for run-time loading.
+# renderer FFI loads `libgpui_nim_shim.so` at run time via `dynlib`.
+# Compile-time resolution only needs the path switch below; how the
+# tests find the shim at run time is described at the Justfile's
+# `_matrix` recipe.
 switch("path", "$config/../isonim-gpui/src")
 
 # RS-M4: Freya streaming adapter pulls `isonim_freya/renderer`. As
-# with the GPUI shim, run-time loading needs `LD_LIBRARY_PATH` to
-# include `../isonim-freya/rust/target/debug`; the flake's
-# shellHook handles that.
+# with the GPUI shim, run-time loading is the Justfile's job: its test
+# recipes run under `../isonim-freya/tools/with_shim_path.sh`.
 switch("path", "$config/../isonim-freya/src")
 
 # RS-M5 (partial-linux): Cocoa adapter pulls `isonim_cocoa/renderer`.

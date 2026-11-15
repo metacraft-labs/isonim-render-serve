@@ -31,10 +31,26 @@
 ##
 ## Per-call min/median/p99 numbers are printed for the campaign
 ## acceptance gate (ETS-M6) to consult.
+##
+## ## When the budget is asserted
+##
+## Only when the timed loop ran on an uncontended host, as classified by
+## ``tests/contention_guard.nim``: the 1-minute load average per usable
+## CPU was at most 1.0 before and after the loop, the measuring thread
+## spent at most 5 % of the loop's wall time waiting on a run queue, and
+## its cgroup was not throttled by a CPU quota. Otherwise the test prints
+## ``NOT MEASURED`` with those readings and reports itself skipped, never
+## passed. The budget itself, and the build modes in which it is
+## asserted, are unchanged. A sleeping or blocking implementation raises
+## none of the three signals, so a genuinely slow implementation still
+## fails. Where a platform lacks a signal (only Linux has the last two;
+## Windows has no load average) the guard's header says how it decides.
 
 import std/[algorithm, monotimes, strformat, times, unittest]
 
 import isonim_render_serve
+
+import ./contention_guard
 
 # ---------------------------------------------------------------------------
 # Synthetic manifest builders
@@ -104,6 +120,8 @@ type
     medianNs: int64
     p99Ns: int64
     iterations: int
+    verdict: ContentionVerdict
+      ## Whether the timed loop measured the code or a contended host.
 
 proc benchDelta(n: int; iterations: int): BenchStats =
   ## Run ``computeElementTreeDelta(prev, curr)`` ``iterations``
@@ -116,6 +134,7 @@ proc benchDelta(n: int; iterations: int): BenchStats =
   for _ in 0 ..< 10:
     discard computeElementTreeDelta(prev, curr)
   var samples = newSeq[int64](iterations)
+  let probe = startContentionProbe()
   for i in 0 ..< iterations:
     let t0 = getMonoTime()
     let ops = computeElementTreeDelta(prev, curr)
@@ -123,6 +142,7 @@ proc benchDelta(n: int; iterations: int): BenchStats =
     samples[i] = inNanoseconds(t1 - t0)
     doAssert ops.len >= 3,
       "mutation pattern should produce >=3 ops for N=" & $n
+  result.verdict = probe.finish()
   sort(samples, system.cmp[int64])
   result.iterations = iterations
   result.minNs = samples[0]
@@ -151,17 +171,23 @@ suite "ETS-M3 Part A: computeElementTreeDelta perf budget":
     reportStats("settings_app", 48, stats)
     # Budget: <0.1 ms median. Settings_app is the canonical
     # real-launcher size and the budget is tight.
-    check nsToMs(stats.medianNs) < 0.1
+    assertBudgetUnlessContended(stats.verdict,
+      &"median {nsToMs(stats.medianNs):.4f} ms < 0.1 ms",
+      nsToMs(stats.medianNs) < 0.1)
 
   test "N=100: median < 0.3 ms":
     let stats = benchDelta(100, Iterations)
     reportStats("midsize", 100, stats)
     # Budget: <0.3 ms median. 2x the settings_app size.
-    check nsToMs(stats.medianNs) < 0.3
+    assertBudgetUnlessContended(stats.verdict,
+      &"median {nsToMs(stats.medianNs):.4f} ms < 0.3 ms",
+      nsToMs(stats.medianNs) < 0.3)
 
   test "N=500 (audit worst case): median < 1 ms":
     let stats = benchDelta(500, Iterations)
     reportStats("worst-case", 500, stats)
     # Budget: <1 ms median. The audit's published worst-case
     # bound that ETS-M6's acceptance gate consults.
-    check nsToMs(stats.medianNs) < 1.0
+    assertBudgetUnlessContended(stats.verdict,
+      &"median {nsToMs(stats.medianNs):.4f} ms < 1.0 ms",
+      nsToMs(stats.medianNs) < 1.0)
